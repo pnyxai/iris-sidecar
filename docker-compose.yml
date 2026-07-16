@@ -1,0 +1,16 @@
+version: "3.8"
+
+services:
+  iris-sidecar:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - IRIS_CONFIG_PATH=/etc/iris-sidecar/config.yaml
+      # Uncomment to override config values via environment variables:
+      # - PNYX_TOKEN=${PNYX_TOKEN}
+      # - PNYX_IRIS_TOKEN=${PNYX_IRIS_TOKEN}
+      # - IRIS_PORT=8080
+    volumes:
+      - ./config.yaml:/etc/iris-sidecar/config.yaml:ro
+    restart: unless-stopped

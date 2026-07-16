@@ -1,0 +1,13 @@
+pnyx:
+  access_token: "your-pnyx-workgroup-token"
+
+iris:
+  # Optional: OpenAI-style bearer token that clients must send to Iris
+  # token: "local-iris-token"
+  # Optional: defaults to 8080
+  # port: 8080
+
+models:
+  gpt-oss-20b:
+    endpoint: "http://127.0.0.1:8000"
+    model_name: "gpt-oss-20b-INT4"
