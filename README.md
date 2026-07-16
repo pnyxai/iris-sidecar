@@ -3,7 +3,7 @@
 A sidecar app to use your local models in the [Pnyx Gateway](https://www.pnyxai.com) router!
 
 
-![Iris, by Pierre -Narcisse Guérin (detalle, óleo Iris y Morfeo.)](/assets/iris.png)
+![Iris, por Pierre -Narcisse Guérin (detalle, óleo Iris y Morfeo.)](/assets/iris.png)
 
 Iris bridges any client to Pnyx, handling request forwarding, local model routing and fallback.
 - Ultra-lightweight (written in Rust) 
@@ -29,7 +29,7 @@ If your local model is offline or the requests is too complex, the gateway will 
 
 Iris reads a YAML configuration file. By default it looks at:
 
-```
+```sh
 ~/.config/iris-sidecar/config.yaml
 # and
 ./config.yaml
