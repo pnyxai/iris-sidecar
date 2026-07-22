@@ -24,6 +24,7 @@ If your local model is offline or the requests is too complex, the gateway will 
 - **Environment overrides**: Sensitive tokens and the listening port can be set via environment variables.
 - **Streaming support**: Responses from both the gateway and local models are streamed back to the user (SSE/JSON).
 - **Docker ready**: Includes a `Dockerfile` and `docker-compose.yml` for quick deployment without installing Rust.
+- **Gateway fallback**: When enabled, Iris can automatically forward requests to a healthy local model if the gateway returns an error (e.g., connection failure, unauthorized, or payment required). Set `fallback.on_gateway_error: true` and choose a specific model tag or `"random"` for `fallback.fallback_model`.
 
 ## Configuration
 
@@ -50,6 +51,10 @@ iris:
   # token: "local-iris-token"
   # Optional: defaults to
   # port: 8080
+  # Optional: fallback to a local model when the gateway fails or returns an error
+  # fallback:
+  #   on_gateway_error: true
+  #   fallback_model: "random"  # Use "random" or a specific model tag
 
 models:
   my-local-llm-model:

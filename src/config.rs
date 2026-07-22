@@ -59,6 +59,19 @@ pub struct PnyxConfig {
 pub struct IrisConfig {
     pub token: Option<String>, // Optional bearer token clients must send to Iris
     pub port: u16,             // TCP port to listen on (default 8080)
+    pub fallback: Option<FallbackConfig>, // Optional fallback to local model on gateway errors
+}
+
+// ──────────────────────────────────────────────────────────────
+// Fallback configuration
+// ──────────────────────────────────────────────────────────────
+// Controls whether Iris should forward requests to a local model when the
+// gateway fails or returns a non-success status code.
+// ──────────────────────────────────────────────────────────────
+#[derive(Debug, Clone)]
+pub struct FallbackConfig {
+    pub on_gateway_error: bool, // When true, fallback on any gateway error or non-success status
+    pub fallback_model: String, // "random" or a specific model tag
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -100,7 +113,8 @@ impl Config {
     fn from_value(value: Value) -> Result<Self> {
         let pnyx = PnyxConfig::from_value(value.get("pnyx"))
             .with_context(|| "Missing or invalid required section: pnyx")?;
-        let iris = IrisConfig::from_value(value.get("iris"));
+        let iris =
+            IrisConfig::from_value(value.get("iris")).with_context(|| "Invalid section: iris")?;
         let models = match value.get("models") {
             Some(v) => models_from_value(v)?,
             None => HashMap::new(),
@@ -130,7 +144,7 @@ impl PnyxConfig {
 }
 
 impl IrisConfig {
-    fn from_value(value: Option<&Value>) -> Self {
+    fn from_value(value: Option<&Value>) -> Result<Self> {
         match value {
             Some(v) => {
                 let token = v
@@ -142,10 +156,37 @@ impl IrisConfig {
                     .and_then(|v| v.as_u64())
                     .map(|p| p as u16)
                     .unwrap_or_else(|| default_port());
-                IrisConfig { token, port }
+                let fallback = v
+                    .get("fallback")
+                    .map(|f| FallbackConfig::from_value(f))
+                    .transpose()
+                    .with_context(|| "Invalid section: iris.fallback")?;
+                Ok(IrisConfig {
+                    token,
+                    port,
+                    fallback,
+                })
             }
-            None => IrisConfig::default(),
+            None => Ok(IrisConfig::default()),
         }
+    }
+}
+
+impl FallbackConfig {
+    fn from_value(value: &Value) -> Result<Self> {
+        let on_gateway_error = value
+            .get("on_gateway_error")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let fallback_model = value
+            .get("fallback_model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow::anyhow!("Missing required field: fallback.fallback_model"))?;
+        Ok(FallbackConfig {
+            on_gateway_error,
+            fallback_model,
+        })
     }
 }
 

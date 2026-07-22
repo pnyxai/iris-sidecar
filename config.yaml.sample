@@ -6,6 +6,10 @@ iris:
   # token: "local-iris-token"
   # Optional: defaults to 8080
   # port: 8080
+  # Optional: fallback to a local model when the gateway fails or returns an error
+  # fallback:
+  #   on_gateway_error: true
+  #   fallback_model: "random"  # Use "random" or a specific model tag like "gpt-oss-20b"
 
 models:
   gpt-oss-20b:

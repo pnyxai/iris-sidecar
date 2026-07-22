@@ -69,6 +69,19 @@ fn main() -> Result<()> {
         let models_map: Arc<HashMap<String, LocalModel>> =
             Arc::new(models.into_iter().map(|m| (m.model_tag.clone(), m)).collect());
 
+        // 3b. Validate fallback configuration if a specific model tag is requested
+        if let Some(ref fallback) = config.iris.fallback {
+            if fallback.fallback_model != "random" {
+                if !models_map.contains_key(&fallback.fallback_model) {
+                    anyhow::bail!(
+                        "Configured fallback_model '{}' is not listed in the models section",
+                        fallback.fallback_model
+                    );
+                }
+            }
+            tracing::info!("Fallback configured for model: {}", fallback.fallback_model);
+        }
+
         // 4. Build the shared application state that Axum will hand to every request.
         let state = AppState {
             client: reqwest::Client::new(),   // Reusable HTTP client (handles connection pooling)

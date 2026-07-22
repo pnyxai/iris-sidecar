@@ -32,7 +32,8 @@ use axum::{
 // `http_body_util` provides helpers for reading request bodies as bytes
 use http_body_util::BodyExt;
 use reqwest::Client;                  // The HTTP client we use to call the gateway and local models
-use serde_json::json;                 
+use serde_json::json;
+use rand::seq::SliceRandom;           // For picking a random healthy model                 
 
 use crate::config::Config;          
 use crate::models::{LocalModel, RelayData};  
@@ -106,6 +107,122 @@ async fn get_healthy_models(
     }
 
     healthy
+}
+
+// ──────────────────────────────────────────────────────────────
+// stream_reqwest_response
+// ──────────────────────────────────────────────────────────────
+// Converts a `reqwest::Response` into an Axum `Response`, copying
+// status and headers and streaming the body back to the caller.
+// ──────────────────────────────────────────────────────────────
+fn stream_reqwest_response(resp: reqwest::Response) -> Response {
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+    let mut builder = Response::builder().status(status);
+
+    for (key, value) in resp.headers() {
+        let key_str = key.as_str().to_lowercase();
+        if key_str == "content-length" || key_str == "transfer-encoding" {
+            continue;
+        }
+        builder = builder.header(key.as_str(), value.as_bytes());
+    }
+
+    let stream = resp.bytes_stream();
+    let body = Body::from_stream(stream);
+    builder.body(body).unwrap()
+}
+
+// ──────────────────────────────────────────────────────────────
+// call_local_model
+// ──────────────────────────────────────────────────────────────
+// Sends a JSON payload to a local model, overriding the `model` field
+// with the configured local model name.  Returns the raw reqwest
+// response so the caller can stream it back to the user.
+// ──────────────────────────────────────────────────────────────
+async fn call_local_model(
+    client: &Client,
+    parts: &axum::http::request::Parts,
+    mut payload: serde_json::Value,
+    model: &LocalModel,
+) -> Result<reqwest::Response, StatusCode> {
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("model".to_string(), json!(model.model_name));
+    }
+
+    let path = parts.uri.path();
+    let local_path = model.custom_api_path.as_deref().unwrap_or(path);
+    let local_url = format!("{}{}", model.endpoint.trim_end_matches('/'), local_path);
+
+    client
+        .request(parts.method.clone(), &local_url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::error!("Local model request failed: {}", e);
+            StatusCode::BAD_GATEWAY
+        })
+}
+
+// ──────────────────────────────────────────────────────────────
+// should_fallback
+// ──────────────────────────────────────────────────────────────
+// Returns true when the user has enabled gateway-error fallback
+// and at least one local model is currently healthy.
+// ──────────────────────────────────────────────────────────────
+fn should_fallback(state: &AppState, healthy: &[String]) -> bool {
+    if let Some(ref cfg) = state.config.iris.fallback {
+        cfg.on_gateway_error && !healthy.is_empty()
+    } else {
+        false
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// try_fallback
+// ──────────────────────────────────────────────────────────────
+// Attempts to forward the original request to a local model when
+// the gateway fails.  Picks the target model according to the
+// fallback configuration ("random" or a specific tag) and returns
+// the local model's response streamed back to the user.
+// ──────────────────────────────────────────────────────────────
+async fn try_fallback(
+    state: &AppState,
+    parts: &axum::http::request::Parts,
+    body_bytes: &bytes::Bytes,
+    healthy: &[String],
+) -> Result<Response, StatusCode> {
+    let fallback_cfg = state.config.iris.fallback.as_ref().unwrap();
+
+    let model_tag = if fallback_cfg.fallback_model == "random" {
+        healthy
+            .choose(&mut rand::thread_rng())
+            .cloned()
+            .ok_or_else(|| {
+                tracing::warn!("No healthy local models available for random fallback");
+                StatusCode::BAD_GATEWAY
+            })?
+    } else {
+        fallback_cfg.fallback_model.clone()
+    };
+
+    let model = state.models.get(&model_tag).ok_or_else(|| {
+        tracing::warn!("Configured fallback model '{}' not found in local models", model_tag);
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    if !healthy.contains(&model_tag) {
+        tracing::warn!("Configured fallback model '{}' is not healthy", model_tag);
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    let payload: serde_json::Value = serde_json::from_slice(body_bytes).map_err(|e| {
+        tracing::error!("Failed to parse request body for fallback: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
+
+    let local_resp = call_local_model(&state.client, parts, payload, model).await?;
+    Ok(stream_reqwest_response(local_resp))
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -219,12 +336,43 @@ pub async fn relay(
         .body(body_bytes.clone());
 
     // Actually send the request to the gateway and wait for the response
-    let upstream_resp = upstream_req.send().await.map_err(|e| {
-        tracing::error!("Gateway request failed: {}", e);
-        StatusCode::BAD_GATEWAY   // HTTP 502 = upstream server error
-    })?;
+    let upstream_resp = match upstream_req.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::error!("Gateway request failed: {}", e);
+            // Check if we should use the fallback
+            if should_fallback(&state, &healthy) {
+                tracing::debug!("Falling back to local");
+                return try_fallback(&state, &parts, &body_bytes, &healthy).await;
+            } else {
+                // If not, just return an error to the user
+                return Err(StatusCode::BAD_GATEWAY); // HTTP 502 = upstream server error
+            }
+            
+        }
+    };
 
-    // ── Step 4: Inspect the gateway response for the local-request flag ──
+    // ── Step 4: Inspect the gateway response status and local-request flag ──
+    let status = upstream_resp.status();
+    if !status.is_success() {
+        match status.as_u16() {
+            401 => tracing::warn!("Gateway returned 401 Unauthorized"),
+            402 => tracing::warn!("Gateway returned 402 Payment Required"),
+            403 => tracing::warn!("Gateway returned 403 Forbidden"),
+            _ => tracing::warn!("Gateway returned {} error", status),
+        }
+
+        // Check if we should use the fallback
+        if should_fallback(&state, &healthy) {
+            return try_fallback(&state, &parts, &body_bytes, &healthy).await;
+        } else {
+            // If not, just relay the gateway error to the user
+            return Ok(stream_reqwest_response(upstream_resp));
+        }
+
+        
+    }
+
     let local_request = upstream_resp
         .headers()
         .get("Pnyx-Local-Request")
@@ -232,29 +380,10 @@ pub async fn relay(
         .map(|v| v.eq_ignore_ascii_case("true")) // Case-insensitive comparison
         .unwrap_or(false);                       // Missing header → default to false
 
-    // If the gateway does NOT want a local model, just stream the response back
+    // If the gateway is providing us an external generation, just stream the response back
     if !local_request {
-
         tracing::debug!("📦 Routing gateway response!");
-
-        let status = StatusCode::from_u16(upstream_resp.status().as_u16())
-            .unwrap_or(StatusCode::OK);
-
-        let mut builder = Response::builder().status(status);
-
-        // Copy headers from the gateway response, skipping ones that Axum manages
-        for (key, value) in upstream_resp.headers() {
-            let key_str = key.as_str().to_lowercase();
-            if key_str == "content-length" || key_str == "transfer-encoding" {
-                continue;
-            }
-            builder = builder.header(key.as_str(), value.as_bytes());
-        }
-
-        // Convert the reqwest body stream into an Axum body stream
-        let stream = upstream_resp.bytes_stream();
-        let body = Body::from_stream(stream);
-        return Ok(builder.body(body).unwrap());
+        return Ok(stream_reqwest_response(upstream_resp));
     }
 
     // ── Step 5: Local model execution ──
@@ -313,49 +442,6 @@ pub async fn relay(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // e) Override the model name in the JSON payload with the configured local model name
-    if let Some(obj) = payload.as_object_mut() {
-        obj.insert("model".to_string(), json!(model.model_name));
-    }
-
-    // f) Build the URL to the local model.
-    //
-    // We use the original request method and path (the ones Iris received from the user).
-    // If the model config has a `custom_api_path`, we use that instead of the original path.
-    let local_path = model.custom_api_path.as_deref().unwrap_or(path);
-    let local_url = format!("{}{}", model.endpoint.trim_end_matches('/'), local_path);
-
-    // Use the original HTTP method that the user sent to Iris.
-    // The local model receives the same method (GET, POST, etc.) as the original request.
-    let local_method = parts.method.clone();
-
-    // g) Send the request to the local model
-    let local_resp = state
-        .client
-        .request(local_method, &local_url)
-        .json(&payload)               // Send the modified JSON as the request body
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!("Local model request failed: {}", e);
-            StatusCode::BAD_GATEWAY
-        })?;
-
-    // Build the final HTTP response back to the user
-    let status =
-        StatusCode::from_u16(local_resp.status().as_u16()).unwrap_or(StatusCode::OK);
-
-    let mut builder = Response::builder().status(status);
-
-    for (key, value) in local_resp.headers() {
-        let key_str = key.as_str().to_lowercase();
-        if key_str == "content-length" || key_str == "transfer-encoding" {
-            continue;
-        }
-        builder = builder.header(key.as_str(), value.as_bytes());
-    }
-
-    let stream = local_resp.bytes_stream();
-    let body = Body::from_stream(stream);
-    Ok(builder.body(body).unwrap())
+    let local_resp = call_local_model(&state.client, &parts, payload, model).await?;
+    Ok(stream_reqwest_response(local_resp))
 }
