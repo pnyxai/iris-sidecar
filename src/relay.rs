@@ -398,6 +398,15 @@ pub async fn relay(
 
     tracing::debug!("🏠 Routing local response!");
 
+    // Collect any pnyx-* headers from the gateway response so they can
+    // be forwarded back to the client even though the body is generated locally.
+    let mut pnyx_headers = HeaderMap::new();
+    for (key, value) in upstream_resp.headers() {
+        if key.as_str().to_lowercase().starts_with("pnyx-") {
+            pnyx_headers.insert(key.clone(), value.clone());
+        }
+    }
+
     // a) Read the entire gateway body into a byte buffer
     let gateway_body = upstream_resp.bytes().await.map_err(|e| {
         tracing::error!("Failed to read gateway response body: {}", e);
@@ -443,5 +452,13 @@ pub async fn relay(
         })?;
 
     let local_resp = call_local_model(&state.client, &parts, payload, model).await?;
-    Ok(stream_reqwest_response(local_resp))
+    let mut response = stream_reqwest_response(local_resp);
+
+    // Inject the pnyx-* headers from the gateway into the final response
+    for (key, value) in &pnyx_headers {
+        response.headers_mut().insert(key.clone(), value.clone());
+    }
+
+    // Response is actually written to the client here, so order of response generation and headers does not matter.
+    Ok(response)
 }
