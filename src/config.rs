@@ -12,6 +12,7 @@ use std::env;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
 // ──────────────────────────────────────────────────────────────
@@ -33,21 +34,31 @@ use serde_yaml::Value;
 //   • Clone  – ability to duplicate the struct in memory
 //
 // ──────────────────────────────────────────────────────────────
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub pnyx: PnyxConfig, // Gateway connection settings
     pub iris: IrisConfig,
     pub models: HashMap<String, ModelConfig>,
+    #[serde(skip)]
+    pub config_path: PathBuf, // Not serialized — used for write-back
 }
 
 // ──────────────────────────────────────────────────────────────
 // PNYX gateway connection settings
 // ──────────────────────────────────────────────────────────────
 // ──────────────────────────────────────────────────────────────
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PnyxConfig {
-    pub gateway_url: String,
+    pub base_url: String,     // e.g. "https://gateway.pnyxai.com"
+    pub service_name: String, // e.g. "text-generation"
     pub access_token: String, // Token used to authenticate with the gateway
+}
+
+impl PnyxConfig {
+    /// Build the full gateway URL: {base_url}/relay/{service_name}
+    pub fn gateway_url(&self) -> String {
+        format!("{}/relay/{}", self.base_url.trim_end_matches('/'), self.service_name)
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -55,11 +66,26 @@ pub struct PnyxConfig {
 // ──────────────────────────────────────────────────────────────
 // If the whole `iris:` block is missing, we create an `IrisConfig::default()`.
 // ──────────────────────────────────────────────────────────────
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IrisConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>, // Optional bearer token clients must send to Iris
     pub port: u16,             // TCP port to listen on (default 8080)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback: Option<FallbackConfig>, // Optional fallback to local model on gateway errors
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_ui: Option<WebUiConfig>, // Optional web UI dashboard configuration
+}
+
+impl Default for IrisConfig {
+    fn default() -> Self {
+        IrisConfig {
+            token: None,
+            port: default_port(),
+            fallback: None,
+            web_ui: None,
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -68,10 +94,23 @@ pub struct IrisConfig {
 // Controls whether Iris should forward requests to a local model when the
 // gateway fails or returns a non-success status code.
 // ──────────────────────────────────────────────────────────────
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FallbackConfig {
     pub on_gateway_error: bool, // When true, fallback on any gateway error or non-success status
     pub fallback_model: String, // "random" or a specific model tag
+}
+
+// ──────────────────────────────────────────────────────────────
+// Web UI configuration
+// ──────────────────────────────────────────────────────────────
+// Controls the built-in admin dashboard server.
+// ──────────────────────────────────────────────────────────────
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebUiConfig {
+    pub enabled: bool,
+    pub port: u16,
+    #[serde(default = "default_bind_address")]
+    pub bind_address: String,
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -85,10 +124,11 @@ pub struct FallbackConfig {
 //   • custom_api_path   – Optional: overrides the incoming request path when
 //                         Iris calls this local model.
 // ──────────────────────────────────────────────────────────────
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     pub endpoint: String,                // Base URL of the local model
     pub model_name: String,              // Model identifier to use in the JSON payload
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_api_path: Option<String>, // Optional path override for local model calls
 }
 
@@ -98,19 +138,27 @@ pub struct ModelConfig {
 // These plain functions are referenced by `#[serde(default = "...")]`.
 // They must return the exact type of the field they serve.
 // ──────────────────────────────────────────────────────────────
-fn default_gateway_url() -> String {
-    "https://gateway.pnyxai.com/relay/text-generation".to_string()
+fn default_base_url() -> String {
+    "https://gateway.pnyxai.com".to_string()
+}
+
+fn default_service_name() -> String {
+    "text-generation".to_string()
 }
 
 fn default_port() -> u16 {
     8080
 }
 
+fn default_bind_address() -> String {
+    "0.0.0.0".to_string()
+}
+
 // ──────────────────────────────────────────────────────────────
 // Manual parsing from serde_yaml::Value
 // ──────────────────────────────────────────────────────────────
 impl Config {
-    fn from_value(value: Value) -> Result<Self> {
+    fn from_value(value: Value, config_path: PathBuf) -> Result<Self> {
         let pnyx = PnyxConfig::from_value(value.get("pnyx"))
             .with_context(|| "Missing or invalid required section: pnyx")?;
         let iris =
@@ -119,25 +167,31 @@ impl Config {
             Some(v) => models_from_value(v)?,
             None => HashMap::new(),
         };
-        Ok(Config { pnyx, iris, models })
+        Ok(Config { pnyx, iris, models, config_path })
     }
 }
 
 impl PnyxConfig {
     fn from_value(value: Option<&Value>) -> Result<Self> {
         let value = value.ok_or_else(|| anyhow::anyhow!("Missing required section: pnyx"))?;
-        let gateway_url = value
-            .get("gateway_url")
+        let base_url = value
+            .get("base_url")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| default_gateway_url());
+            .unwrap_or_else(|| default_base_url());
+        let service_name = value
+            .get("service_name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| default_service_name());
         let access_token = value
             .get("access_token")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow::anyhow!("Missing required field: pnyx.access_token"))?;
         Ok(PnyxConfig {
-            gateway_url,
+            base_url,
+            service_name,
             access_token,
         })
     }
@@ -161,10 +215,17 @@ impl IrisConfig {
                     .map(|f| FallbackConfig::from_value(f))
                     .transpose()
                     .with_context(|| "Invalid section: iris.fallback")?;
+                let web_ui = v
+                    .get("web_ui")
+                    .and_then(|v| v.as_mapping())
+                    .map(|_| WebUiConfig::from_value(v.get("web_ui")))
+                    .transpose()
+                    .with_context(|| "Invalid section: iris.web_ui")?;
                 Ok(IrisConfig {
                     token,
                     port,
                     fallback,
+                    web_ui,
                 })
             }
             None => Ok(IrisConfig::default()),
@@ -186,6 +247,31 @@ impl FallbackConfig {
         Ok(FallbackConfig {
             on_gateway_error,
             fallback_model,
+        })
+    }
+}
+
+impl WebUiConfig {
+    fn from_value(value: Option<&Value>) -> Result<Self> {
+        let value = value.ok_or_else(|| anyhow::anyhow!("Missing web_ui config value"))?;
+        let enabled = value
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let port = value
+            .get("port")
+            .and_then(|v| v.as_u64())
+            .map(|p| p as u16)
+            .unwrap_or(8081);
+        let bind_address = value
+            .get("bind_address")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| default_bind_address());
+        Ok(WebUiConfig {
+            enabled,
+            port,
+            bind_address,
         })
     }
 }
@@ -253,7 +339,7 @@ impl Config {
         // Step 3 – parse YAML into a generic Value, then convert to Config
         let value: Value = serde_yaml::from_str(&content)
             .with_context(|| format!("Failed to parse config file: {:?}", path))?;
-        let mut config = Config::from_value(value)
+        let mut config = Config::from_value(value, path.clone())
             .with_context(|| format!("Failed to convert config file: {:?}", path))?;
 
         // Step 4 – environment overrides (highest priority)
@@ -270,6 +356,17 @@ impl Config {
         }
 
         Ok(config)
+    }
+
+    /// Save the current configuration back to disk.
+    /// Uses serde_yaml to produce a clean YAML file.
+    pub fn save(&self) -> Result<()> {
+        let yaml = serde_yaml::to_string(self)
+            .with_context(|| "Failed to serialize config to YAML")?;
+        std::fs::write(&self.config_path, yaml)
+            .with_context(|| format!("Failed to write config file: {:?}", self.config_path))?;
+        tracing::info!("Saved config to {:?}", self.config_path);
+        Ok(())
     }
 
     /// Decide where the YAML file lives.

@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ── Axum (web framework) imports ──
 use axum::{
@@ -38,22 +38,7 @@ use serde_json::json; // For picking a random healthy model
 
 use crate::config::Config;
 use crate::models::{LocalModel, RelayData};
-
-// ──────────────────────────────────────────────────────────────
-// AppState – shared state that every request handler can access
-// ──────────────────────────────────────────────────────────────
-// In Axum, when you create a `Router`, you attach a `State` object to it.
-// Every time a request hits the server, Axum passes a clone of this state
-// into the handler function (`relay`). Because we use `Arc` (atomic reference
-// counting), cloning is cheap – it just increments a pointer, it does NOT
-// duplicate the data in memory.
-// ──────────────────────────────────────────────────────────────
-#[derive(Clone)]
-pub struct AppState {
-    pub client: Client, // Reusable HTTP client (connection pooling)
-    pub config: Config, // The loaded YAML config + env overrides
-    pub models: Arc<HashMap<String, LocalModel>>, // All local models, keyed by name
-}
+use crate::web::SharedState;
 
 // ──────────────────────────────────────────────────────────────
 // get_healthy_models
@@ -168,8 +153,8 @@ async fn call_local_model(
 // Returns true when the user has enabled gateway-error fallback
 // and at least one local model is currently healthy.
 // ──────────────────────────────────────────────────────────────
-fn should_fallback(state: &AppState, healthy: &[String]) -> bool {
-    if let Some(ref cfg) = state.config.iris.fallback {
+fn should_fallback(config: &Config, healthy: &[String]) -> bool {
+    if let Some(ref cfg) = config.iris.fallback {
         cfg.on_gateway_error && !healthy.is_empty()
     } else {
         false
@@ -185,12 +170,14 @@ fn should_fallback(state: &AppState, healthy: &[String]) -> bool {
 // the local model's response streamed back to the user.
 // ──────────────────────────────────────────────────────────────
 async fn try_fallback(
-    state: &AppState,
+    config: &Config,
+    models: &HashMap<String, LocalModel>,
+    client: &Client,
     parts: &axum::http::request::Parts,
     body_bytes: &bytes::Bytes,
     healthy: &[String],
 ) -> Result<Response, StatusCode> {
-    let fallback_cfg = state.config.iris.fallback.as_ref().unwrap();
+    let fallback_cfg = config.iris.fallback.as_ref().unwrap();
 
     let model_tag = if fallback_cfg.fallback_model == "random" {
         healthy
@@ -204,7 +191,7 @@ async fn try_fallback(
         fallback_cfg.fallback_model.clone()
     };
 
-    let model = state.models.get(&model_tag).ok_or_else(|| {
+    let model = models.get(&model_tag).ok_or_else(|| {
         tracing::warn!(
             "Configured fallback model '{}' not found in local models",
             model_tag
@@ -222,7 +209,7 @@ async fn try_fallback(
         StatusCode::BAD_REQUEST
     })?;
 
-    let local_resp = call_local_model(&state.client, parts, payload, model).await?;
+    let local_resp = call_local_model(client, parts, payload, model).await?;
     Ok(stream_reqwest_response(local_resp))
 }
 
@@ -240,12 +227,23 @@ async fn try_fallback(
 //   • `Ok(Response)` = a successful HTTP response we send back to the user.
 //   • `Err(StatusCode)` = a short error response (e.g. 500, 502) with no body.
 // ──────────────────────────────────────────────────────────────
-pub async fn relay(State(state): State<AppState>, req: Request) -> Result<Response, StatusCode> {
+pub async fn relay(
+    State(state): State<Arc<tokio::sync::RwLock<SharedState>>>,
+    req: Request,
+) -> Result<Response, StatusCode> {
+    let start = Instant::now();
+
+    // Lock briefly to read config and models, then release
+    let (config, models, client) = {
+        let guard = state.read().await;
+        (guard.config.clone(), guard.models.clone(), guard.client.clone())
+    };
+
     // ── Step 1: Optional local authentication ──
     // If the user put a token in the YAML (`iris.token`), we require every
     // incoming request to carry `Authorization: Bearer <that_token>`.
     // This mimics how OpenAI API clients already send tokens.
-    if let Some(ref token) = state.config.iris.token {
+    if let Some(ref token) = config.iris.token {
         let auth = req
             .headers()
             .get("authorization")
@@ -284,7 +282,8 @@ pub async fn relay(State(state): State<AppState>, req: Request) -> Result<Respon
         .unwrap_or_default(); // Otherwise use an empty string
 
     // ── Step 3: Prepare the request to the PNYX gateway ──
-    let gateway_base = state.config.pnyx.gateway_url.trim_end_matches('/');
+    let gateway_url = config.pnyx.gateway_url();
+    let gateway_base = gateway_url.trim_end_matches('/');
     let upstream_url = format!("{}{}{}", gateway_base, path, query);
 
     // Start with a fresh header map for the upstream request
@@ -306,7 +305,21 @@ pub async fn relay(State(state): State<AppState>, req: Request) -> Result<Respon
     upstream_headers.insert("Pnyx-Sidecar-Request", HeaderValue::from_static("true"));
 
     // Check local model health and, if any are up, tell the gateway which are available
-    let healthy = get_healthy_models(&state.client, &state.models).await;
+    let healthy = get_healthy_models(&client, &models).await;
+
+    // Update shared model health cache so the UI is fresh
+    {
+        let mut guard = state.write().await;
+        for tag in &healthy {
+            guard.model_health.insert(tag.clone(), true);
+        }
+        for (tag, _) in &models {
+            if !healthy.contains(tag) {
+                guard.model_health.insert(tag.clone(), false);
+            }
+        }
+    }
+
     if !healthy.is_empty() {
         let value = healthy.join(","); // e.g. "model-a,model-b"
         upstream_headers.insert(
@@ -318,13 +331,12 @@ pub async fn relay(State(state): State<AppState>, req: Request) -> Result<Respon
     // Attach the PNYX access token (from YAML or PNYX_TOKEN env var)
     upstream_headers.insert(
         "Authorization",
-        HeaderValue::from_str(&format!("Bearer {}", state.config.pnyx.access_token))
+        HeaderValue::from_str(&format!("Bearer {}", config.pnyx.access_token))
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
     );
 
     // Build the reqwest request object
-    let upstream_req = state
-        .client
+    let upstream_req = client
         .request(parts.method.clone(), &upstream_url)
         .headers(upstream_headers)
         .body(body_bytes.clone());
@@ -335,9 +347,14 @@ pub async fn relay(State(state): State<AppState>, req: Request) -> Result<Respon
         Err(e) => {
             tracing::error!("Gateway request failed: {}", e);
             // Check if we should use the fallback
-            if should_fallback(&state, &healthy) {
+            if should_fallback(&config, &healthy) {
                 tracing::debug!("Falling back to local");
-                return try_fallback(&state, &parts, &body_bytes, &healthy).await;
+                let resp = try_fallback(&config, &models, &client, &parts, &body_bytes, &healthy).await;
+                if let Ok(ref _r) = resp {
+                    let ms = start.elapsed().as_millis() as u64;
+                    state.read().await.metrics.record_local(ms);
+                }
+                return resp;
             } else {
                 // If not, just return an error to the user
                 return Err(StatusCode::BAD_GATEWAY); // HTTP 502 = upstream server error
@@ -376,6 +393,8 @@ pub async fn relay(State(state): State<AppState>, req: Request) -> Result<Respon
                 "error": err_msg,
                 "gateway_response": gateway_response
             });
+            let ms = start.elapsed().as_millis() as u64;
+            state.read().await.metrics.record_pnyx(ms);
             return Ok((status, Json(body)).into_response());
         }
 
@@ -386,10 +405,17 @@ pub async fn relay(State(state): State<AppState>, req: Request) -> Result<Respon
         }
 
         // Check if we should use the fallback
-        if should_fallback(&state, &healthy) {
-            return try_fallback(&state, &parts, &body_bytes, &healthy).await;
+        if should_fallback(&config, &healthy) {
+            let resp = try_fallback(&config, &models, &client, &parts, &body_bytes, &healthy).await;
+            if let Ok(ref _r) = resp {
+                let ms = start.elapsed().as_millis() as u64;
+                state.read().await.metrics.record_local(ms);
+            }
+            return resp;
         } else {
             // If not, just relay the gateway error to the user
+            let ms = start.elapsed().as_millis() as u64;
+            state.read().await.metrics.record_pnyx(ms);
             return Ok(stream_reqwest_response(upstream_resp));
         }
     }
@@ -404,6 +430,8 @@ pub async fn relay(State(state): State<AppState>, req: Request) -> Result<Respon
     // If the gateway is providing us an external generation, just stream the response back
     if !local_request {
         tracing::debug!("📦 Routing gateway response!");
+        let ms = start.elapsed().as_millis() as u64;
+        state.read().await.metrics.record_pnyx(ms);
         return Ok(stream_reqwest_response(upstream_resp));
     }
 
@@ -412,7 +440,7 @@ pub async fn relay(State(state): State<AppState>, req: Request) -> Result<Respon
     //   a) Read the gateway response body as JSON
     //   b) Extract the `relay_data` field and parse `model_tag`
     //   c) Remove `relay_data` from the payload so it stays OpenAI-compatible
-    //   d) Look up the model in Iris's local config using `model_tag` as the key
+    //   d) Look up the model in our local map using `model_tag` as the key
     //   e) Override the `model` field in the JSON with the configured local model name
     //   f) Call the local model using the original method and path (or a custom override)
     //   g) Stream the local model's response back to the user
@@ -458,21 +486,26 @@ pub async fn relay(State(state): State<AppState>, req: Request) -> Result<Respon
     }
 
     // d) Look up the model in our local map using the tag from the gateway
-    let model = state.models.get(&relay_data.model_tag).ok_or_else(|| {
+    let model = models.get(&relay_data.model_tag).ok_or_else(|| {
         tracing::error!(
             "Missing local model '{}'. This is unexpected.",
             relay_data.model_tag
         );
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    tracing::debug!("🏠 Model: {}", relay_data.model_tag);
 
-    let local_resp = call_local_model(&state.client, &parts, payload, model).await?;
+    let local_resp = call_local_model(&client, &parts, payload, model).await?;
     let mut response = stream_reqwest_response(local_resp);
 
     // Inject the pnyx-* headers from the gateway into the final response
     for (key, value) in &pnyx_headers {
         response.headers_mut().insert(key.clone(), value.clone());
     }
+
+    // Record local metrics
+    let ms = start.elapsed().as_millis() as u64;
+    state.read().await.metrics.record_local(ms);
 
     // Response is actually written to the client here, so order of response generation and headers does not matter.
     Ok(response)

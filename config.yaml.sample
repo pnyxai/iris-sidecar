@@ -1,5 +1,7 @@
 pnyx:
   access_token: "your-pnyx-workgroup-token"
+  base_url: "https://gateway.pnyxai.com"
+  service_name: "text-generation"
 
 iris:
   # Optional: OpenAI-style bearer token that clients must send to Iris
@@ -10,6 +12,11 @@ iris:
   # fallback:
   #   on_gateway_error: true
   #   fallback_model: "random"  # Use "random" or a specific model tag like "gpt-oss-20b"
+  # Optional: built-in admin dashboard (enabled by default on port 8081)
+  # web_ui:
+  #   enabled: true
+  #   port: 8081
+  #   bind_address: "0.0.0.0"
 
 models:
   gpt-oss-20b:

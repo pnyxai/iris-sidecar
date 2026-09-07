@@ -7,6 +7,8 @@
 // All the business logic lives in `relay.rs` and `main.rs`.
 // ──────────────────────────────────────────────────────────────
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 // ──────────────────────────────────────────────────────────────
 // LocalModel – a model running on the user's machine
 // ──────────────────────────────────────────────────────────────
@@ -53,5 +55,62 @@ impl RelayData {
             .ok_or_else(|| anyhow::anyhow!("Missing field: model_tag"))?
             .to_string();
         Ok(RelayData { model_tag })
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Metrics – counters and timing for local vs PNYX relay
+// ──────────────────────────────────────────────────────────────
+#[derive(Debug)]
+pub struct Metrics {
+    pub local_requests: AtomicU64,
+    pub local_total_ms: AtomicU64,
+    pub pnyx_requests: AtomicU64,
+    pub pnyx_total_ms: AtomicU64,
+    pub last_pnyx_status: std::sync::Mutex<String>,
+    pub last_pnyx_check_time: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Metrics {
+            local_requests: AtomicU64::new(0),
+            local_total_ms: AtomicU64::new(0),
+            pnyx_requests: AtomicU64::new(0),
+            pnyx_total_ms: AtomicU64::new(0),
+            last_pnyx_status: std::sync::Mutex::new("unknown".to_string()),
+            last_pnyx_check_time: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl Metrics {
+    pub fn record_local(&self, duration_ms: u64) {
+        self.local_requests.fetch_add(1, Ordering::Relaxed);
+        self.local_total_ms.fetch_add(duration_ms, Ordering::Relaxed);
+    }
+
+    pub fn record_pnyx(&self, duration_ms: u64) {
+        self.pnyx_requests.fetch_add(1, Ordering::Relaxed);
+        self.pnyx_total_ms.fetch_add(duration_ms, Ordering::Relaxed);
+    }
+
+    pub fn local_stats(&self) -> (u64, u64) {
+        let count = self.local_requests.load(Ordering::Relaxed);
+        let total = self.local_total_ms.load(Ordering::Relaxed);
+        (count, total)
+    }
+
+    pub fn pnyx_stats(&self) -> (u64, u64) {
+        let count = self.pnyx_requests.load(Ordering::Relaxed);
+        let total = self.pnyx_total_ms.load(Ordering::Relaxed);
+        (count, total)
+    }
+
+    pub fn set_pnyx_status(&self, status: String) {
+        let mut guard = self.last_pnyx_status.lock().unwrap();
+        *guard = status;
+        let mut time_guard = self.last_pnyx_check_time.lock().unwrap();
+        *time_guard = Some(std::time::Instant::now());
     }
 }
