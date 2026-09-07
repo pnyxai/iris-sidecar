@@ -17,26 +17,27 @@
 //         config, and call the local model. Then stream that response back.
 // ──────────────────────────────────────────────────────────────
 
-use std::collections::HashMap;    
-use std::sync::Arc;               
-use std::time::Duration;          
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 // ── Axum (web framework) imports ──
 use axum::{
-    body::Body,                        // Axum's request/response body type
-    extract::{Request, State},         // `Request` = incoming HTTP data; `State` = shared application state
-    http::{HeaderMap, HeaderValue, StatusCode},  // HTTP primitives
-    response::{IntoResponse, Response},           // Traits/types for building responses
+    body::Body,                                 // Axum's request/response body type
+    extract::{Request, State}, // `Request` = incoming HTTP data; `State` = shared application state
+    http::{HeaderMap, HeaderValue, StatusCode}, // HTTP primitives
+    response::{IntoResponse, Response}, // Traits/types for building responses
+    Json,                      // JSON response helper
 };
 
 // `http_body_util` provides helpers for reading request bodies as bytes
 use http_body_util::BodyExt;
-use reqwest::Client;                  // The HTTP client we use to call the gateway and local models
-use serde_json::json;
-use rand::seq::SliceRandom;           // For picking a random healthy model                 
+use rand::seq::SliceRandom;
+use reqwest::Client; // The HTTP client we use to call the gateway and local models
+use serde_json::json; // For picking a random healthy model
 
-use crate::config::Config;          
-use crate::models::{LocalModel, RelayData};  
+use crate::config::Config;
+use crate::models::{LocalModel, RelayData};
 
 // ──────────────────────────────────────────────────────────────
 // AppState – shared state that every request handler can access
@@ -49,8 +50,8 @@ use crate::models::{LocalModel, RelayData};
 // ──────────────────────────────────────────────────────────────
 #[derive(Clone)]
 pub struct AppState {
-    pub client: Client,                          // Reusable HTTP client (connection pooling)
-    pub config: Config,                          // The loaded YAML config + env overrides
+    pub client: Client, // Reusable HTTP client (connection pooling)
+    pub config: Config, // The loaded YAML config + env overrides
     pub models: Arc<HashMap<String, LocalModel>>, // All local models, keyed by name
 }
 
@@ -71,10 +72,7 @@ pub struct AppState {
 //
 // Returns: Vec<String> containing the names of healthy models.
 // ──────────────────────────────────────────────────────────────
-async fn get_healthy_models(
-    client: &Client,
-    models: &HashMap<String, LocalModel>,
-) -> Vec<String> {
+async fn get_healthy_models(client: &Client, models: &HashMap<String, LocalModel>) -> Vec<String> {
     let mut healthy = Vec::new();
 
     // Loop through every model we know about
@@ -207,7 +205,10 @@ async fn try_fallback(
     };
 
     let model = state.models.get(&model_tag).ok_or_else(|| {
-        tracing::warn!("Configured fallback model '{}' not found in local models", model_tag);
+        tracing::warn!(
+            "Configured fallback model '{}' not found in local models",
+            model_tag
+        );
         StatusCode::BAD_GATEWAY
     })?;
 
@@ -239,11 +240,7 @@ async fn try_fallback(
 //   • `Ok(Response)` = a successful HTTP response we send back to the user.
 //   • `Err(StatusCode)` = a short error response (e.g. 500, 502) with no body.
 // ──────────────────────────────────────────────────────────────
-pub async fn relay(
-    State(state): State<AppState>,
-    req: Request,
-) -> Result<Response, StatusCode> {
-
+pub async fn relay(State(state): State<AppState>, req: Request) -> Result<Response, StatusCode> {
     // ── Step 1: Optional local authentication ──
     // If the user put a token in the YAML (`iris.token`), we require every
     // incoming request to carry `Authorization: Bearer <that_token>`.
@@ -252,14 +249,14 @@ pub async fn relay(
         let auth = req
             .headers()
             .get("authorization")
-            .and_then(|v| v.to_str().ok());     // Convert header bytes to a UTF-8 string
+            .and_then(|v| v.to_str().ok()); // Convert header bytes to a UTF-8 string
 
         let expected = format!("Bearer {}", token);
 
         if auth != Some(&expected) {
             tracing::warn!("Unauthorized request");
-            // Return HTTP 401 (Unauthorized) with a plain-text body
-            return Ok((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
+            let body = json!({ "error": "Unauthorized" });
+            return Ok((StatusCode::UNAUTHORIZED, Json(body)).into_response());
         }
     }
 
@@ -270,21 +267,21 @@ pub async fn relay(
     let (parts, body) = req.into_parts();
 
     let body_bytes = body
-        .collect()                // Collect all chunks of the stream
+        .collect() // Collect all chunks of the stream
         .await
         .map_err(|e| {
             tracing::error!("Failed to read request body: {}", e);
             StatusCode::BAD_REQUEST
         })?
-        .to_bytes();              // Convert the collected chunks into a `bytes::Bytes` object
+        .to_bytes(); // Convert the collected chunks into a `bytes::Bytes` object
 
     // Remember the path and query string so we can reconstruct the upstream URL
     let path = parts.uri.path();
     let query = parts
         .uri
         .query()
-        .map(|q| format!("?{}", q))   // If there is a query, prepend `?`
-        .unwrap_or_default();         // Otherwise use an empty string
+        .map(|q| format!("?{}", q)) // If there is a query, prepend `?`
+        .unwrap_or_default(); // Otherwise use an empty string
 
     // ── Step 3: Prepare the request to the PNYX gateway ──
     let gateway_base = state.config.pnyx.gateway_url.trim_end_matches('/');
@@ -306,15 +303,12 @@ pub async fn relay(
     }
 
     // Add the header that tells the gateway: "this request came from a side-car"
-    upstream_headers.insert(
-        "Pnyx-Sidecar-Request",
-        HeaderValue::from_static("true"),
-    );
+    upstream_headers.insert("Pnyx-Sidecar-Request", HeaderValue::from_static("true"));
 
     // Check local model health and, if any are up, tell the gateway which are available
     let healthy = get_healthy_models(&state.client, &state.models).await;
     if !healthy.is_empty() {
-        let value = healthy.join(",");   // e.g. "model-a,model-b"
+        let value = healthy.join(","); // e.g. "model-a,model-b"
         upstream_headers.insert(
             "Pnyx-Local-Suppliers",
             HeaderValue::from_str(&value).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
@@ -348,17 +342,46 @@ pub async fn relay(
                 // If not, just return an error to the user
                 return Err(StatusCode::BAD_GATEWAY); // HTTP 502 = upstream server error
             }
-            
         }
     };
 
     // ── Step 4: Inspect the gateway response status and local-request flag ──
     let status = upstream_resp.status();
     if !status.is_success() {
-        match status.as_u16() {
-            401 => tracing::warn!("Gateway returned 401 Unauthorized"),
-            402 => tracing::warn!("Gateway returned 402 Payment Required"),
-            403 => tracing::warn!("Gateway returned 403 Forbidden"),
+        // Handle 400 BadRequest specially: do not fallback, return JSON error
+        if status == StatusCode::BAD_REQUEST || status == StatusCode::UNAUTHORIZED {
+            let mut err_msg= "";
+            match status {
+                StatusCode::BAD_REQUEST => {
+                    tracing::warn!("Gateway returned 400 BadRequest — sidecar is misconfigured");
+                    err_msg = "Sidecar misconfigured.";
+                },
+                StatusCode::UNAUTHORIZED => {
+                    tracing::warn!("Gateway returned 401 Unauthorized — is the token correct?");
+                    err_msg = "Sidecar token unauthorized.";
+                },
+                _ => {
+                    // Should never happen
+                },
+            }
+            let gateway_body = upstream_resp.bytes().await.map_err(|e| {
+                tracing::error!("Failed to read gateway response body: {}", e);
+                StatusCode::BAD_GATEWAY
+            })?;
+            let gateway_response = serde_json::from_slice::<serde_json::Value>(&gateway_body)
+                .unwrap_or_else(|_| {
+                    serde_json::Value::String(String::from_utf8_lossy(&gateway_body).to_string())
+                });
+            let body = json!({
+                "error": err_msg,
+                "gateway_response": gateway_response
+            });
+            return Ok((status, Json(body)).into_response());
+        }
+
+        match status {
+            StatusCode::PAYMENT_REQUIRED => tracing::warn!("Gateway returned 402 Payment Required"),
+            StatusCode::FORBIDDEN => tracing::warn!("Gateway returned 403 Forbidden"),
             _ => tracing::warn!("Gateway returned {} error", status),
         }
 
@@ -369,16 +392,14 @@ pub async fn relay(
             // If not, just relay the gateway error to the user
             return Ok(stream_reqwest_response(upstream_resp));
         }
-
-        
     }
 
     let local_request = upstream_resp
         .headers()
         .get("Pnyx-Local-Request")
-        .and_then(|v| v.to_str().ok())          // Convert header bytes to string
+        .and_then(|v| v.to_str().ok()) // Convert header bytes to string
         .map(|v| v.eq_ignore_ascii_case("true")) // Case-insensitive comparison
-        .unwrap_or(false);                       // Missing header → default to false
+        .unwrap_or(false); // Missing header → default to false
 
     // If the gateway is providing us an external generation, just stream the response back
     if !local_request {
@@ -420,13 +441,10 @@ pub async fn relay(
     })?;
 
     // Extract `relay_data` (clone it so we can remove it from the payload later)
-    let relay_data = payload
-        .get("relay_data")
-        .cloned()
-        .ok_or_else(|| {
-            tracing::error!("Missing relay_data in gateway response");
-            StatusCode::BAD_GATEWAY
-        })?;
+    let relay_data = payload.get("relay_data").cloned().ok_or_else(|| {
+        tracing::error!("Missing relay_data in gateway response");
+        StatusCode::BAD_GATEWAY
+    })?;
 
     // Convert the generic JSON into our strongly typed `RelayData` struct
     let relay_data = RelayData::from_json_value(&relay_data).map_err(|e| {
@@ -440,16 +458,13 @@ pub async fn relay(
     }
 
     // d) Look up the model in our local map using the tag from the gateway
-    let model = state
-        .models
-        .get(&relay_data.model_tag)
-        .ok_or_else(|| {
-            tracing::error!(
-                "Missing local model '{}'. This is unexpected.",
-                relay_data.model_tag
-            );
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let model = state.models.get(&relay_data.model_tag).ok_or_else(|| {
+        tracing::error!(
+            "Missing local model '{}'. This is unexpected.",
+            relay_data.model_tag
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let local_resp = call_local_model(&state.client, &parts, payload, model).await?;
     let mut response = stream_reqwest_response(local_resp);

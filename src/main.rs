@@ -11,9 +11,9 @@
 // ──────────────────────────────────────────────────────────────
 
 // Modules
-mod config;   // Configuration parsing (YAML, env vars)
-mod models;   // Plain data structs (LocalModel, RelayData)
-mod relay;    // The core request handler and forwarding logic
+mod config; // Configuration parsing (YAML, env vars)
+mod models; // Plain data structs (LocalModel, RelayData)
+mod relay; // The core request handler and forwarding logic
 
 use crate::config::Config;
 use crate::models::LocalModel;
@@ -21,8 +21,8 @@ use crate::relay::AppState;
 
 // Standard library imports
 use std::collections::HashMap;
-use std::sync::Arc;              // Arc = "Atomic Reference Counted" pointer; allows safe sharing
-                                 // of data across many concurrent requests without copying it.
+use std::sync::Arc; // Arc = "Atomic Reference Counted" pointer; allows safe sharing
+                    // of data across many concurrent requests without copying it.
 
 // External crate imports
 use anyhow::Result;
@@ -32,7 +32,6 @@ use axum::Router;
 // Loggin
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-
 
 // ──────────────────────────────────────────────────────────────
 // main
@@ -66,8 +65,12 @@ fn main() -> Result<()> {
 
         // Convert the Vec<LocalModel> into a HashMap so we can look up models by name instantly.
         // We wrap it in `Arc` so every request handler can read the same map without copying it.
-        let models_map: Arc<HashMap<String, LocalModel>> =
-            Arc::new(models.into_iter().map(|m| (m.model_tag.clone(), m)).collect());
+        let models_map: Arc<HashMap<String, LocalModel>> = Arc::new(
+            models
+                .into_iter()
+                .map(|m| (m.model_tag.clone(), m))
+                .collect(),
+        );
 
         // 3b. Validate fallback configuration if a specific model tag is requested
         if let Some(ref fallback) = config.iris.fallback {
@@ -84,9 +87,9 @@ fn main() -> Result<()> {
 
         // 4. Build the shared application state that Axum will hand to every request.
         let state = AppState {
-            client: reqwest::Client::new(),   // Reusable HTTP client (handles connection pooling)
-            config,                           // The loaded configuration
-            models: models_map,               // The map of local models
+            client: reqwest::Client::new(), // Reusable HTTP client (handles connection pooling)
+            config,                         // The loaded configuration
+            models: models_map,             // The map of local models
         };
 
         // 5. Set up the Axum router
@@ -95,7 +98,7 @@ fn main() -> Result<()> {
         // `.route("/*path", any(relay::relay))` says:
         //   "For every URL path and every HTTP method, call the `relay` function in `relay.rs`."
         // `.with_state(state)` attaches our shared state so `relay` can access config and models.
-        let port = state.config.iris.port;   // Read the port before we move `state` into the router
+        let port = state.config.iris.port; // Read the port before we move `state` into the router
         let app = Router::new()
             .route("/*path", any(relay::relay))
             .with_state(state);
@@ -103,8 +106,7 @@ fn main() -> Result<()> {
         // 6. Bind to a TCP socket and start serving
         //
         // The port comes from the YAML or the `IRIS_PORT` environment variable.
-        let listener =
-            tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+        let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
         tracing::info!("Iris sidecar listening on {}", listener.local_addr()?);
 
         // `axum::serve` runs the server loop forever (or until the process is killed).
