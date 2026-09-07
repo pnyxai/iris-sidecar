@@ -25,6 +25,7 @@ If your local model is offline or the requests is too complex, the gateway will 
 - **Streaming support**: Responses from both the gateway and local models are streamed back to the user (SSE/JSON).
 - **Docker ready**: Includes a `Dockerfile` and `docker-compose.yml` for quick deployment without installing Rust.
 - **Gateway fallback**: When enabled, Iris can automatically forward requests to a healthy local model if the gateway returns an error (e.g., connection failure, unauthorized, or payment required). Set `fallback.on_gateway_error: true` and choose a specific model tag or `"random"` for `fallback.fallback_model`.
+- **Built-in Web UI**: Iris includes a live admin dashboard (enabled by default on port `8081`) where you can view model health, request stats, and edit the configuration in real time. The dashboard auto-refreshes every 10 seconds and updates `config.yaml` automatically when you make changes.
 
 ## Configuration
 
@@ -43,8 +44,10 @@ You can override the path with the `IRIS_CONFIG_PATH` environment variable.
 ```yaml
 pnyx:
   access_token: "your-pnyx-token"
-  # Optional: defaults to 
-  # gateway_url: "https://gateway.pnyxai.com/relay/text-generation"
+  # Optional: defaults to "https://gateway.pnyxai.com"
+  # base_url: "https://gateway.pnyxai.com"
+  # Optional: defaults to "text-generation"
+  # service_name: "text-generation"
 
 iris:
   # Optional: OpenAI-style bearer token that clients must send to Iris
@@ -55,6 +58,11 @@ iris:
   # fallback:
   #   on_gateway_error: true
   #   fallback_model: "random"  # Use "random" or a specific model tag
+  # Optional: built-in admin dashboard (enabled by default on port 8081)
+  # web_ui:
+  #   enabled: true
+  #   port: 8081
+  #   bind_address: "0.0.0.0"
 
 models:
   my-local-llm-model:
