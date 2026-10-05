@@ -278,7 +278,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <div class="card">
   <h2>Local Models</h2>
   <table id="models-table">
-    <thead><tr><th>PNYX Reference Tag</th><th>Configured</th><th>Endpoint</th><th>Model Name</th><th>Custom API Path</th><th></th></tr></thead>
+    <thead><tr><th>PNYX Reference Tag</th><th>PNYX Remote Configured</th><th>Endpoint</th><th>Model Name</th><th>Custom API Path</th><th></th></tr></thead>
     <tbody></tbody>
   </table>
   <h3>Add Model</h3>
@@ -303,7 +303,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 </div>
 
 <div class="card">
-  <h2>External Models</h2>
+  <h2>External Models <a href="https://app.pnyxai.com/routing/groups" target="_blank" style="font-size:0.85rem; color:var(--accent); text-decoration:none; margin-left:0.5rem;">Configure models in PNYX →</a></h2>
   <table id="external-models-table">
     <thead><tr><th>PNYX Reference Tag</th><th>Provider</th></tr></thead>
     <tbody></tbody>
@@ -332,6 +332,11 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 
   function normalizeModelId(id) {
     return typeof id === 'string' && id.startsWith('PNYX/') ? id.slice(5) : id;
+  }
+
+  function stripProviderPrefix(ownedBy) {
+    if (typeof ownedBy !== 'string') return ownedBy || '';
+    return ownedBy.startsWith('User Backend by ') ? ownedBy.slice(16) : ownedBy;
   }
 
   function escapeHtml(str) {
@@ -393,7 +398,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       externalTbody.insertAdjacentHTML('beforeend', '<tr><td colspan="2">No external models available.</td></tr>');
     } else {
       for (const m of externalModels) {
-        externalTbody.insertAdjacentHTML('beforeend', `<tr><td>${escapeHtml(m.normalizedId)}</td><td>${escapeHtml(m.owned_by || '')}</td></tr>`);
+        externalTbody.insertAdjacentHTML('beforeend', `<tr><td>${escapeHtml(m.normalizedId)}</td><td>${escapeHtml(stripProviderPrefix(m.owned_by))}</td></tr>`);
       }
     }
   }
@@ -411,7 +416,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       }
       document.getElementById('models-health').innerHTML = html || 'No models configured.';
       const ps = document.getElementById('pnyx-status');
-      ps.innerHTML = `<span class="indicator ${d.pnyx.status.startsWith('Error') ? 'bad' : 'good'}"></span>Status: ${d.pnyx.status}<br><span class="mono">Last checked: ${d.pnyx.last_checked}</span>`;
+      ps.innerHTML = `<span class="indicator ${d.pnyx.status === '200 OK' ? 'good' : 'bad'}"></span>Status: ${d.pnyx.status}<br><span class="mono">Last checked: ${d.pnyx.last_checked}</span>`;
 
       const snapshot = JSON.stringify({ models: d.models, pnyx: d.pnyx.status });
       if (lastHealthSnapshot !== null && lastHealthSnapshot !== snapshot) {
