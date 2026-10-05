@@ -46,6 +46,7 @@ pub fn build_router(state: WebState) -> Router {
         .route("/api/health", get(api_health))
         .route("/api/stats", get(api_stats))
         .route("/api/available_models", get(api_available_models))
+        .route("/api/v1_models", get(api_v1_models))
         .route("/api/refresh_models", post(api_refresh_models))
         .route("/api/config", get(api_config).post(api_config_update))
         .route("/api/models", post(api_models_update))
@@ -77,10 +78,16 @@ pub async fn health_checker_task(client: reqwest::Client, state: WebState) {
         locked.model_health = new_health;
         locked.last_health_check = Some(Instant::now());
 
-        // Check PNYX gateway (lightweight HEAD against the base origin)
-        let pnyx_base = locked.config.pnyx.base_url.clone();
-        let pnyx_status = match client.head(&pnyx_base).timeout(Duration::from_secs(5)).send().await {
-            Ok(resp) => format!("{}", resp.status()),
+        // Check PNYX gateway health endpoint
+        let pnyx_health = format!("{}/healthz", locked.config.pnyx.base_url.trim_end_matches('/'));
+        let pnyx_status = match client.get(&pnyx_health).timeout(Duration::from_secs(5)).send().await {
+            Ok(resp) => {
+                if resp.status() == StatusCode::OK {
+                    "200 OK".to_string()
+                } else {
+                    format!("Error: HTTP {}", resp.status())
+                }
+            }
             Err(e) => format!("Error: {}", e),
         };
         locked.metrics.set_pnyx_status(pnyx_status);
@@ -136,6 +143,57 @@ pub async fn fetch_available_models(
 
     tracing::info!("Fetched {} available models from PNYX", tags.len());
     Ok(tags)
+}
+
+// ──────────────────────────────────────────────────────────────
+// Fetch OpenAI-style /v1/models list from PNYX gateway
+// ──────────────────────────────────────────────────────────────
+async fn api_v1_models(State(state): State<WebState>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let (client, gateway_url, access_token, local_suppliers) = {
+        let guard = state.read().await;
+        let healthy: Vec<String> = guard
+            .model_health
+            .iter()
+            .filter(|(_, healthy)| **healthy)
+            .map(|(name, _)| name.clone())
+            .collect();
+        (
+            guard.client.clone(),
+            guard.config.pnyx.gateway_url(),
+            guard.config.pnyx.access_token.clone(),
+            healthy.join(","),
+        )
+    };
+
+    let url = format!("{}/v1/models", gateway_url.trim_end_matches('/'));
+    let mut req = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("Pnyx-Sidecar-Request", "true");
+    if !local_suppliers.is_empty() {
+        req = req.header("Pnyx-Local-Suppliers", local_suppliers);
+    }
+    match req.timeout(Duration::from_secs(10)).send().await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            if !status.is_success() {
+                tracing::warn!("Failed to fetch /v1/models: HTTP {} from {}", status, url);
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+            match resp.json::<serde_json::Value>().await {
+                Ok(body) => Ok(Json(body)),
+                Err(e) => {
+                    tracing::warn!("Failed to parse /v1/models response: {}", e);
+                    Err(StatusCode::BAD_GATEWAY)
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to fetch /v1/models: {}", e);
+            Err(StatusCode::BAD_GATEWAY)
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -218,9 +276,9 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 </div>
 
 <div class="card">
-  <h2>Models</h2>
+  <h2>Local Models</h2>
   <table id="models-table">
-    <thead><tr><th>PNYX Reference Tag</th><th>Endpoint</th><th>Model Name</th><th>Custom API Path</th><th></th></tr></thead>
+    <thead><tr><th>PNYX Reference Tag</th><th>PNYX Remote Configured</th><th>Endpoint</th><th>Model Name</th><th>Custom API Path</th><th></th></tr></thead>
     <tbody></tbody>
   </table>
   <h3>Add Model</h3>
@@ -244,8 +302,19 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   </div>
 </div>
 
+<div class="card">
+  <h2>External Models <a href="https://app.pnyxai.com/routing/groups" target="_blank" style="font-size:0.85rem; color:var(--accent); text-decoration:none; margin-left:0.5rem;">Configure models in PNYX →</a></h2>
+  <table id="external-models-table">
+    <thead><tr><th>PNYX Reference Tag</th><th>Provider</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
 <script>
   let availableModels = [];
+  let v1Models = [];
+  let currentConfig = null;
+  let lastHealthSnapshot = null;
 
   function showMsg(txt, good=true) {
     const m = document.getElementById('msg');
@@ -261,6 +330,79 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     return Math.floor(secs/3600) + 'h ago';
   }
 
+  function normalizeModelId(id) {
+    return typeof id === 'string' && id.startsWith('PNYX/') ? id.slice(5) : id;
+  }
+
+  function stripProviderPrefix(ownedBy) {
+    if (typeof ownedBy !== 'string') return ownedBy || '';
+    return ownedBy.startsWith('User Backend by ') ? ownedBy.slice(16) : ownedBy;
+  }
+
+  function escapeHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  }
+
+  async function loadV1Models() {
+    try {
+      const r = await fetch('/api/v1_models');
+      if (!r.ok) throw new Error('Failed to fetch /v1/models');
+      const d = await r.json();
+      v1Models = Array.isArray(d.data) ? d.data : [];
+      renderModels();
+    } catch (e) { console.error(e); }
+  }
+
+  function renderModels() {
+    if (!currentConfig) return;
+    const configured = currentConfig.models || {};
+    const configuredIds = new Set(Object.keys(configured));
+
+    const normalizedV1 = v1Models.map(m => ({
+      id: m.id,
+      normalizedId: normalizeModelId(m.id),
+      owned_by: m.owned_by,
+    }));
+
+    const localBackendIds = new Set(
+      normalizedV1
+        .filter(m => m.owned_by === 'Local User Backend' && configuredIds.has(m.normalizedId))
+        .map(m => m.normalizedId)
+    );
+
+    const externalModels = normalizedV1.filter(m => {
+      if (m.id === 'PNYX/router' || m.id === 'PNYX/pocket_network') return false;
+      return !configuredIds.has(m.normalizedId);
+    });
+
+    const tbody = document.querySelector('#models-table tbody');
+    tbody.innerHTML = '';
+    const availableSet = new Set(availableModels);
+
+    for (const [tag, m] of Object.entries(configured)) {
+      const isLocalBackend = localBackendIds.has(tag);
+      const configuredMark = isLocalBackend ? '<span title="Listed as Local User Backend">✓</span>' : '';
+      const valid = availableSet.has(tag);
+      const badge = valid ? '' : '<span class="badge badge-bad">Not available in PNYX</span>';
+      tbody.insertAdjacentHTML('beforeend', `<tr><td>${escapeHtml(tag)}${badge}</td><td style="text-align:center">${configuredMark}</td><td>${escapeHtml(m.endpoint)}</td><td>${escapeHtml(m.model_name)}</td><td>${escapeHtml(m.custom_api_path || '')}</td><td><button onclick="removeModel('${escapeHtml(tag)}')">Remove</button></td></tr>`);
+    }
+
+    const externalTbody = document.querySelector('#external-models-table tbody');
+    externalTbody.innerHTML = '';
+    if (externalModels.length === 0) {
+      externalTbody.insertAdjacentHTML('beforeend', '<tr><td colspan="2">No external models available.</td></tr>');
+    } else {
+      for (const m of externalModels) {
+        externalTbody.insertAdjacentHTML('beforeend', `<tr><td>${escapeHtml(m.normalizedId)}</td><td>${escapeHtml(stripProviderPrefix(m.owned_by))}</td></tr>`);
+      }
+    }
+  }
+
   async function loadHealth() {
     try {
       const r = await fetch('/api/health');
@@ -274,7 +416,15 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       }
       document.getElementById('models-health').innerHTML = html || 'No models configured.';
       const ps = document.getElementById('pnyx-status');
-      ps.innerHTML = `<span class="indicator ${d.pnyx.status.startsWith('Error') ? 'bad' : 'good'}"></span>Status: ${d.pnyx.status}<br><span class="mono">Last checked: ${d.pnyx.last_checked}</span>`;
+      ps.innerHTML = `<span class="indicator ${d.pnyx.status === '200 OK' ? 'good' : 'bad'}"></span>Status: ${d.pnyx.status}<br><span class="mono">Last checked: ${d.pnyx.last_checked}</span>`;
+
+      const snapshot = JSON.stringify({ models: d.models, pnyx: d.pnyx.status });
+      if (lastHealthSnapshot !== null && lastHealthSnapshot !== snapshot) {
+        lastHealthSnapshot = snapshot;
+        await loadV1Models();
+      } else {
+        lastHealthSnapshot = snapshot;
+      }
     } catch (e) { console.error(e); }
   }
 
@@ -321,6 +471,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       if (r.ok) {
         showMsg('PNYX models refreshed');
         await loadAvailableModels();
+        renderModels();
       } else {
         showMsg('Failed to refresh PNYX models', false);
       }
@@ -336,6 +487,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     try {
       const [cfgR, availR] = await Promise.all([fetch('/api/config'), fetch('/api/available_models')]);
       const d = await cfgR.json();
+      currentConfig = d;
       const availD = await availR.json();
       availableModels = availD.models || [];
       updateTagDropdown();
@@ -349,14 +501,8 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       }
       if (fb) sel.value = fb.fallback_model || 'random';
 
-      const tbody = document.querySelector('#models-table tbody');
-      tbody.innerHTML = '';
-      const availableSet = new Set(availableModels);
-      for (const [tag, m] of Object.entries(d.models || {})) {
-        const valid = availableSet.has(tag);
-        const badge = valid ? '' : '<span class="badge badge-bad">Not available in PNYX</span>';
-        tbody.insertAdjacentHTML('beforeend', `<tr><td>${tag}${badge}</td><td>${m.endpoint}</td><td>${m.model_name}</td><td>${m.custom_api_path || ''}</td><td><button onclick="removeModel('${tag}')">Remove</button></td></tr>`);
-      }
+      renderModels();
+      await loadV1Models();
     } catch (e) { console.error(e); }
   }
 
@@ -364,7 +510,11 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     const token = document.getElementById('token-input').value;
     if (!token) return showMsg('Enter a token', false);
     const r = await fetch('/api/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({pnyx_access_token: token}) });
-    if (r.ok) { showMsg('Token updated'); document.getElementById('token-input').value = ''; }
+    if (r.ok) {
+      showMsg('Token updated');
+      document.getElementById('token-input').value = '';
+      await loadConfig();
+    }
     else showMsg('Failed to update token', false);
   }
 
@@ -372,7 +522,10 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     const enabled = document.getElementById('fallback-enabled').checked;
     const model = document.getElementById('fallback-model').value;
     const r = await fetch('/api/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({fallback: {on_gateway_error: enabled, fallback_model: model}}) });
-    if (r.ok) showMsg('Fallback saved');
+    if (r.ok) {
+      showMsg('Fallback saved');
+      await loadConfig();
+    }
     else showMsg('Failed to save fallback', false);
   }
 
@@ -383,14 +536,14 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     const custom_api_path = document.getElementById('new-custom-path').value.trim() || null;
     if (!tag || !endpoint || !model_name) return showMsg('Fill all required fields', false);
     const r = await fetch('/api/models', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({action:'add', tag, endpoint, model_name, custom_api_path}) });
-    if (r.ok) { showMsg('Model added'); loadConfig(); }
+    if (r.ok) { showMsg('Model added'); await loadConfig(); }
     else showMsg('Failed to add model', false);
   }
 
   async function removeModel(tag) {
     if (!confirm('Remove model "' + tag + '"?')) return;
     const r = await fetch('/api/models', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({action:'remove', tag}) });
-    if (r.ok) { showMsg('Model removed'); loadConfig(); }
+    if (r.ok) { showMsg('Model removed'); await loadConfig(); }
     else showMsg('Failed to remove model', false);
   }
 
