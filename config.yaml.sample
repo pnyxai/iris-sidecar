@@ -22,3 +22,6 @@ models:
   gpt-oss-20b:
     endpoint: "http://127.0.0.1:8000"
     model_name: "gpt-oss-20b-INT4"
+    # Optional: extra headers sent to this local model on generation and health checks
+    # custom_headers:
+    #   Authorization: "Bearer local-token"

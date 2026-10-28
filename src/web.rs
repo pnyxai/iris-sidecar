@@ -69,7 +69,12 @@ pub async fn health_checker_task(client: reqwest::Client, state: WebState) {
         // Check every local model
         for (name, model) in &locked.models {
             let url = format!("{}/health", model.endpoint.trim_end_matches('/'));
-            let healthy = match client.get(&url).timeout(Duration::from_secs(5)).send().await {
+            let healthy = match model
+                .apply_custom_headers(client.get(&url))
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await
+            {
                 Ok(resp) => resp.status().is_success(),
                 Err(_) => false,
             };
@@ -278,7 +283,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <div class="card">
   <h2>Local Models</h2>
   <table id="models-table">
-    <thead><tr><th>PNYX Reference Tag</th><th>PNYX Remote Configured</th><th>Endpoint</th><th>Model Name</th><th>Custom API Path</th><th></th></tr></thead>
+    <thead><tr><th>PNYX Reference Tag</th><th>PNYX Remote Configured</th><th>Endpoint</th><th>Model Name</th><th>Custom API Path</th><th>Custom Headers</th><th></th></tr></thead>
     <tbody></tbody>
   </table>
   <h3>Add Model</h3>
@@ -298,6 +303,10 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   <div class="row">
     <label>Custom API Path <span class="tooltip" data-tip="Only needed if your endpoint does not serve /v1. Provide the actual path it supports for OpenAI-style calls.">(?)</span></label>
     <input id="new-custom-path" placeholder="/v1/chat/completions (optional)" />
+  </div>
+  <div class="row">
+    <label>Custom Headers <span class="tooltip" data-tip="Optional JSON object of headers sent on generation and health-check requests, e.g. an Authorization token.">(?)</span></label>
+    <input id="new-custom-headers" size="50" placeholder='{"Authorization":"Bearer local-token"} (optional)' />
     <button id="add-btn" onclick="addModel()" disabled>Add</button>
   </div>
 </div>
@@ -389,7 +398,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       const configuredMark = isLocalBackend ? '<span title="Listed as Local User Backend">✓</span>' : '';
       const valid = availableSet.has(tag);
       const badge = valid ? '' : '<span class="badge badge-bad">Not available in PNYX</span>';
-      tbody.insertAdjacentHTML('beforeend', `<tr><td>${escapeHtml(tag)}${badge}</td><td style="text-align:center">${configuredMark}</td><td>${escapeHtml(m.endpoint)}</td><td>${escapeHtml(m.model_name)}</td><td>${escapeHtml(m.custom_api_path || '')}</td><td><button onclick="removeModel('${escapeHtml(tag)}')">Remove</button></td></tr>`);
+      tbody.insertAdjacentHTML('beforeend', `<tr><td>${escapeHtml(tag)}${badge}</td><td style="text-align:center">${configuredMark}</td><td>${escapeHtml(m.endpoint)}</td><td>${escapeHtml(m.model_name)}</td><td>${escapeHtml(m.custom_api_path || '')}</td><td>${escapeHtml(Object.keys(m.custom_headers || {}).join(', '))}</td><td><button onclick="removeModel('${escapeHtml(tag)}')">Remove</button></td></tr>`);
     }
 
     const externalTbody = document.querySelector('#external-models-table tbody');
@@ -534,8 +543,20 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     const endpoint = document.getElementById('new-endpoint').value.trim();
     const model_name = document.getElementById('new-model-name').value.trim();
     const custom_api_path = document.getElementById('new-custom-path').value.trim() || null;
+    const headersRaw = document.getElementById('new-custom-headers').value.trim();
+    let custom_headers = {};
+    if (headersRaw) {
+      try {
+        custom_headers = JSON.parse(headersRaw);
+      } catch (e) {
+        return showMsg('Custom headers must be valid JSON', false);
+      }
+      if (typeof custom_headers !== 'object' || Array.isArray(custom_headers) || custom_headers === null) {
+        return showMsg('Custom headers must be a JSON object', false);
+      }
+    }
     if (!tag || !endpoint || !model_name) return showMsg('Fill all required fields', false);
-    const r = await fetch('/api/models', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({action:'add', tag, endpoint, model_name, custom_api_path}) });
+    const r = await fetch('/api/models', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({action:'add', tag, endpoint, model_name, custom_api_path, custom_headers}) });
     if (r.ok) { showMsg('Model added'); await loadConfig(); }
     else showMsg('Failed to add model', false);
   }
@@ -668,6 +689,17 @@ async fn api_config(State(state): State<WebState>) -> Json<serde_json::Value> {
             }
         }
     }
+    if let Some(models) = cfg.get_mut("models").and_then(|m| m.as_object_mut()) {
+        for model in models.values_mut() {
+            if let Some(headers) = model.get_mut("custom_headers").and_then(|h| h.as_object_mut()) {
+                for value in headers.values_mut() {
+                    if value.as_str().is_some() {
+                        *value = json!("***");
+                    }
+                }
+            }
+        }
+    }
 
     Json(cfg)
 }
@@ -749,6 +781,7 @@ struct ModelUpdate {
     endpoint: Option<String>,
     model_name: Option<String>,
     custom_api_path: Option<String>,
+    custom_headers: Option<HashMap<String, String>>,
 }
 
 async fn api_models_update(
@@ -762,6 +795,7 @@ async fn api_models_update(
             let endpoint = payload.endpoint.ok_or(StatusCode::BAD_REQUEST)?;
             let model_name = payload.model_name.ok_or(StatusCode::BAD_REQUEST)?;
             let custom_api_path = payload.custom_api_path;
+            let custom_headers = payload.custom_headers.unwrap_or_default();
 
             let tag = payload.tag;
             locked.config.models.insert(
@@ -770,6 +804,7 @@ async fn api_models_update(
                     endpoint: endpoint.clone(),
                     model_name: model_name.clone(),
                     custom_api_path: custom_api_path.clone(),
+                    custom_headers: custom_headers.clone(),
                 },
             );
             locked.models.insert(
@@ -779,6 +814,7 @@ async fn api_models_update(
                     endpoint,
                     model_name,
                     custom_api_path,
+                    custom_headers,
                 },
             );
             locked.model_health.insert(tag, false); // unknown until next check

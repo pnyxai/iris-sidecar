@@ -66,8 +66,8 @@ async fn get_healthy_models(client: &Client, models: &HashMap<String, LocalModel
         let url = format!("{}/health", model.endpoint.trim_end_matches('/'));
 
         // Send a GET request with a 5-second timeout
-        match client
-            .get(&url)
+        match model
+            .apply_custom_headers(client.get(&url))
             .timeout(Duration::from_secs(5))
             .send()
             .await
@@ -136,9 +136,12 @@ async fn call_local_model(
     let local_path = model.custom_api_path.as_deref().unwrap_or(path);
     let local_url = format!("{}{}", model.endpoint.trim_end_matches('/'), local_path);
 
-    client
+    let request = client
         .request(parts.method.clone(), &local_url)
-        .json(&payload)
+        .json(&payload);
+
+    model
+        .apply_custom_headers(request)
         .send()
         .await
         .map_err(|e| {

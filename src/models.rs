@@ -18,6 +18,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 //
 // The `custom_api_path` field is optional. If it is set, Iris will use it
 // instead of the original request path when calling this local model.
+//
+// The `custom_headers` field is optional. Its entries are added to every
+// request Iris makes to this model, including health checks. This is useful
+// for authorization tokens or any other endpoint-specific headers.
 // ──────────────────────────────────────────────────────────────
 #[derive(Debug, Clone)]
 pub struct LocalModel {
@@ -25,6 +29,45 @@ pub struct LocalModel {
     pub endpoint: String,  // Base URL, e.g. "http://localhost:1234"
     pub model_name: String, // The model identifier to send in the JSON payload
     pub custom_api_path: Option<String>, // Optional path override for local model calls
+    pub custom_headers: std::collections::HashMap<String, String>, // Optional headers sent to the local model
+}
+
+impl LocalModel {
+    /// Add this model's custom headers to a request builder.
+    /// Invalid header names or values are skipped with a warning rather than
+    /// failing the whole request.
+    pub fn apply_custom_headers(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in &self.custom_headers {
+            let header_name = match reqwest::header::HeaderName::try_from(name.as_str()) {
+                Ok(name) => name,
+                Err(_) => {
+                    tracing::warn!(
+                        "Ignoring invalid header name '{}' for model '{}'",
+                        name,
+                        self.model_tag
+                    );
+                    continue;
+                }
+            };
+            let header_value = match reqwest::header::HeaderValue::try_from(value.as_str()) {
+                Ok(value) => value,
+                Err(_) => {
+                    tracing::warn!(
+                        "Ignoring invalid value for header '{}' on model '{}'",
+                        name,
+                        self.model_tag
+                    );
+                    continue;
+                }
+            };
+            headers.insert(header_name, header_value);
+        }
+        builder.headers(headers)
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -112,5 +155,51 @@ impl Metrics {
         *guard = status;
         let mut time_guard = self.last_pnyx_check_time.lock().unwrap();
         *time_guard = Some(std::time::Instant::now());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_model(custom_headers: std::collections::HashMap<String, String>) -> LocalModel {
+        LocalModel {
+            model_tag: "test-model".to_string(),
+            endpoint: "http://localhost:1234".to_string(),
+            model_name: "local".to_string(),
+            custom_api_path: None,
+            custom_headers,
+        }
+    }
+
+    #[test]
+    fn applies_custom_headers_to_requests() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer local-token".to_string());
+        let model = test_model(headers);
+
+        let request = model
+            .apply_custom_headers(reqwest::Client::new().get("http://localhost:1234/health"))
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer local-token"
+        );
+    }
+
+    #[test]
+    fn skips_invalid_custom_headers() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Invalid Header".to_string(), "value".to_string());
+        let model = test_model(headers);
+
+        let request = model
+            .apply_custom_headers(reqwest::Client::new().get("http://localhost:1234/health"))
+            .build()
+            .unwrap();
+
+        assert!(request.headers().get("Invalid Header").is_none());
     }
 }

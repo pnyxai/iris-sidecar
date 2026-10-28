@@ -123,6 +123,8 @@ pub struct WebUiConfig {
 //   • model_name        – Model identifier to send in the JSON payload
 //   • custom_api_path   – Optional: overrides the incoming request path when
 //                         Iris calls this local model.
+//   • custom_headers    – Optional: extra HTTP headers sent to this local model
+//                         on generation and health-check requests (e.g. auth).
 // ──────────────────────────────────────────────────────────────
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
@@ -130,6 +132,8 @@ pub struct ModelConfig {
     pub model_name: String,              // Model identifier to use in the JSON payload
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_api_path: Option<String>, // Optional path override for local model calls
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub custom_headers: HashMap<String, String>, // Optional headers sent to the local model
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -293,10 +297,16 @@ impl ModelConfig {
             .get("custom_api_path")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let custom_headers = match value.get("custom_headers") {
+            Some(v) if !v.is_null() => serde_yaml::from_value::<HashMap<String, String>>(v.clone())
+                .with_context(|| "custom_headers must be a map of string to string")?,
+            _ => HashMap::new(),
+        };
         Ok(ModelConfig {
             endpoint,
             model_name,
             custom_api_path,
+            custom_headers,
         })
     }
 }
@@ -388,5 +398,48 @@ impl Config {
                     PathBuf::from("config.yaml")
                 }
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_model_custom_headers() {
+        let value: Value = serde_yaml::from_str(
+            r#"
+endpoint: "http://localhost:1234"
+model_name: "local-llama"
+custom_headers:
+  Authorization: "Bearer local-token"
+  X-Custom: "value"
+"#,
+        )
+        .unwrap();
+
+        let model = ModelConfig::from_value(Some(&value)).unwrap();
+        assert_eq!(
+            model.custom_headers.get("Authorization").map(String::as_str),
+            Some("Bearer local-token")
+        );
+        assert_eq!(
+            model.custom_headers.get("X-Custom").map(String::as_str),
+            Some("value")
+        );
+    }
+
+    #[test]
+    fn empty_model_custom_headers_default_to_empty_map() {
+        let value: Value = serde_yaml::from_str(
+            r#"
+endpoint: "http://localhost:1234"
+model_name: "local-llama"
+"#,
+        )
+        .unwrap();
+
+        let model = ModelConfig::from_value(Some(&value)).unwrap();
+        assert!(model.custom_headers.is_empty());
     }
 }

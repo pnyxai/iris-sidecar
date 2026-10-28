@@ -72,6 +72,9 @@ models:
     model_name: "local-llama"
     # Optional: overrides the incoming request path when calling this local model
     # custom_api_path: "/v1/chat/completions"
+    # Optional: extra headers sent to this local model on generation and health checks
+    # custom_headers:
+    #   Authorization: "Bearer local-token"
 ```
 
 ### Environment variables

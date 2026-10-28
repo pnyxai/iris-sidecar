@@ -169,6 +169,7 @@ fn build_models_from_config(config: &Config) -> Vec<LocalModel> {
             endpoint: cfg.endpoint.clone(),
             model_name: cfg.model_name.clone(),
             custom_api_path: cfg.custom_api_path.clone(),
+            custom_headers: cfg.custom_headers.clone(),
         });
     }
 
