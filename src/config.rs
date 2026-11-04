@@ -41,6 +41,8 @@ pub struct Config {
     pub models: HashMap<String, ModelConfig>,
     #[serde(skip)]
     pub config_path: PathBuf, // Not serialized — used for write-back
+    #[serde(skip)]
+    pub read_only: bool, // Not serialized — set via IRIS_CONFIG_READONLY env var
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -158,6 +160,12 @@ fn default_bind_address() -> String {
     "0.0.0.0".to_string()
 }
 
+/// Parse a boolean from an environment variable.
+/// Accepts "true", "1", "yes" (case-insensitive); anything else is false.
+fn parse_bool_env(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes")
+}
+
 // ──────────────────────────────────────────────────────────────
 // Manual parsing from serde_yaml::Value
 // ──────────────────────────────────────────────────────────────
@@ -171,7 +179,7 @@ impl Config {
             Some(v) => models_from_value(v)?,
             None => HashMap::new(),
         };
-        Ok(Config { pnyx, iris, models, config_path })
+        Ok(Config { pnyx, iris, models, config_path, read_only: false })
     }
 }
 
@@ -337,7 +345,8 @@ impl Config {
     /// 2. Read the file into a string.
     /// 3. Parse the YAML into `Config`.
     /// 4. Apply environment-variable overrides (PNYX_TOKEN, PNYX_IRIS_TOKEN, IRIS_PORT).
-    /// 5. Return the finished config.
+    /// 5. Apply read-only mode (IRIS_CONFIG_READONLY) for stateless deployments.
+    /// 6. Return the finished config.
     pub fn load() -> Result<Self> {
         // Step 1 – figure out which file to read
         let path = Self::resolve_path();
@@ -365,12 +374,24 @@ impl Config {
             }
         }
 
+        // Step 5 – read-only mode (for stateless deployments where config.yaml is immutable)
+        if let Ok(val) = env::var("IRIS_CONFIG_READONLY") {
+            config.read_only = parse_bool_env(&val);
+        }
+        if config.read_only {
+            tracing::info!("Config is read-only (IRIS_CONFIG_READONLY): web UI edits and config saves are disabled");
+        }
+
         Ok(config)
     }
 
     /// Save the current configuration back to disk.
     /// Uses serde_yaml to produce a clean YAML file.
+    /// Refuses to write when running in read-only mode.
     pub fn save(&self) -> Result<()> {
+        if self.read_only {
+            anyhow::bail!("Config is read-only (IRIS_CONFIG_READONLY); refusing to write {:?}", self.config_path);
+        }
         let yaml = serde_yaml::to_string(self)
             .with_context(|| "Failed to serialize config to YAML")?;
         std::fs::write(&self.config_path, yaml)
@@ -441,5 +462,21 @@ model_name: "local-llama"
 
         let model = ModelConfig::from_value(Some(&value)).unwrap();
         assert!(model.custom_headers.is_empty());
+    }
+
+    #[test]
+    fn parse_bool_env_accepts_common_truthy_values() {
+        assert!(parse_bool_env("true"));
+        assert!(parse_bool_env("TRUE"));
+        assert!(parse_bool_env("1"));
+        assert!(parse_bool_env("yes"));
+    }
+
+    #[test]
+    fn parse_bool_env_treats_everything_else_as_false() {
+        assert!(!parse_bool_env("false"));
+        assert!(!parse_bool_env("FALSE"));
+        assert!(!parse_bool_env("0"));
+        assert!(!parse_bool_env("no"));
     }
 }

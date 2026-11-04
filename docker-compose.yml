@@ -5,12 +5,16 @@ services:
     build: .
     ports:
       - "8080:8080"
+      - "8081:8081"
     environment:
       - IRIS_CONFIG_PATH=/etc/iris-sidecar/config.yaml
       # Uncomment to override config values via environment variables:
       # - PNYX_TOKEN=${PNYX_TOKEN}
       # - PNYX_IRIS_TOKEN=${PNYX_IRIS_TOKEN}
       # - IRIS_PORT=8080
+      # Uncomment to lock the config for stateless deployments (Web UI becomes view-only,
+      # config.yaml is never written). The volume below is already mounted read-only.
+      # - IRIS_CONFIG_READONLY=true
     volumes:
       - ./config.yaml:/etc/iris-sidecar/config.yaml:ro
     restart: unless-stopped

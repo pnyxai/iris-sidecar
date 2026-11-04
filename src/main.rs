@@ -103,12 +103,12 @@ fn main() -> Result<()> {
             async move {
                 match web::fetch_available_models(&client, &pnyx_config).await {
                     Ok(models) => {
-                        tracing::info!("Loaded {} available models from PNYX on startup", models.len());
+                        tracing::info!("Loaded {} available models signatures from PNYX on startup", models.len());
                         let mut locked = state.write().await;
                         locked.available_models = models;
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to fetch available models on startup: {}", e);
+                        tracing::warn!("Failed to fetch available models signatures on startup: {}", e);
                     }
                 }
             }

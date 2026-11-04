@@ -25,7 +25,7 @@ If your local model is offline or the requests is too complex, the gateway will 
 - **Streaming support**: Responses from both the gateway and local models are streamed back to the user (SSE/JSON).
 - **Docker ready**: Includes a `Dockerfile` and `docker-compose.yml` for quick deployment without installing Rust.
 - **Gateway fallback**: When enabled, Iris can automatically forward requests to a healthy local model if the gateway returns an error (e.g., connection failure, unauthorized, or payment required). Set `fallback.on_gateway_error: true` and choose a specific model tag or `"random"` for `fallback.fallback_model`.
-- **Built-in Web UI**: Iris includes a live admin dashboard (enabled by default on port `8081`) where you can view model health, request stats, and edit the configuration in real time. The dashboard auto-refreshes every 10 seconds and updates `config.yaml` automatically when you make changes.
+- **Built-in Web UI**: Iris includes a live admin dashboard (enabled by default on port `8081`) where you can view model health, request stats, and edit the configuration in real time. The dashboard auto-refreshes every 10 seconds and updates `config.yaml` automatically when you make changes. Set `IRIS_CONFIG_READONLY=true` to run the dashboard in view-only mode (for stateless deployments), which hides all config-editing controls and refuses any write to `config.yaml`.
 
 ## Configuration
 
@@ -85,6 +85,7 @@ models:
 | `PNYX_TOKEN` | Overrides `pnyx.access_token` from the config. |
 | `PNYX_IRIS_TOKEN` | Overrides `iris.token` from the config. |
 | `IRIS_PORT` | Overrides `iris.port` from the config. |
+| `IRIS_CONFIG_READONLY` | When `true` (default `false`), the config becomes read-only for stateless deployments. The Web UI hides all config-mutating controls (add/remove model, update token, save fallback) and the `/api/config` and `/api/models` endpoints return `403 Forbidden`. `config.yaml` is never written. |
 
 ## Running locally
 

@@ -123,7 +123,7 @@ pub async fn fetch_available_models(
     let status = resp.status();
     if !status.is_success() {
         tracing::warn!(
-            "Failed to fetch available models: HTTP {} from {}",
+            "Failed to fetch available models signatures: HTTP {} from {}",
             status,
             url
         );
@@ -146,7 +146,7 @@ pub async fn fetch_available_models(
 
     tags.sort();
 
-    tracing::info!("Fetched {} available models from PNYX", tags.len());
+    tracing::info!("Fetched {} available models signatures from PNYX", tags.len());
     Ok(tags)
 }
 
@@ -237,6 +237,8 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   .tooltip:hover::after { content: attr(data-tip); position: absolute; bottom: 120%; left: 50%; transform: translateX(-50%); background: #21262d; color: var(--text); padding: 0.4rem 0.6rem; border-radius: 4px; white-space: nowrap; font-size: 0.8rem; border: 1px solid #30363d; z-index: 100; }
   .badge { display: inline-block; padding: 0.1rem 0.4rem; border-radius: 4px; font-size: 0.75rem; margin-left: 0.5rem; }
   .badge-bad { background: var(--bad); color: #fff; }
+  .badge-readonly { background: var(--warn); color: #000; }
+  .hide-readonly { display: none !important; }
 </style>
 </head>
 <body>
@@ -260,13 +262,13 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 </div>
 
 <div class="card">
-  <h2>Configuration</h2>
-  <div class="row">
+  <h2>Configuration <span id="readonly-badge" class="badge badge-readonly" style="display:none">Read-only</span></h2>
+  <div class="row" id="token-row">
     <label>PNYX Access Token:</label>
     <input type="password" id="token-input" size="40" placeholder="(hidden)" />
     <button onclick="saveToken()">Update Token</button>
   </div>
-  <div class="row" style="margin-top: -0.3rem; font-size: 0.85rem;">
+  <div class="row" id="token-help-row" style="margin-top: -0.3rem; font-size: 0.85rem;">
     <a href="https://app.pnyxai.com" target="_blank" style="color: var(--accent); text-decoration: none;">Don't have a token? Create an account</a>
   </div>
   <div class="row">
@@ -276,7 +278,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     <select id="fallback-model">
       <option value="random">random</option>
     </select>
-    <button onclick="saveFallback()">Save Fallback</button>
+    <button id="save-fallback-btn" onclick="saveFallback()">Save Fallback</button>
   </div>
 </div>
 
@@ -286,6 +288,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     <thead><tr><th>PNYX Reference Tag</th><th>PNYX Remote Configured</th><th>Endpoint</th><th>Model Name</th><th>Custom API Path</th><th>Custom Headers</th><th></th></tr></thead>
     <tbody></tbody>
   </table>
+  <div id="add-model-section">
   <h3>Add Model</h3>
   <div class="row">
     <label>PNYX Tag:</label>
@@ -308,6 +311,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     <label>Custom Headers <span class="tooltip" data-tip="Optional JSON object of headers sent on generation and health-check requests, e.g. an Authorization token.">(?)</span></label>
     <input id="new-custom-headers" size="50" placeholder='{"Authorization":"Bearer local-token"} (optional)' />
     <button id="add-btn" onclick="addModel()" disabled>Add</button>
+  </div>
   </div>
 </div>
 
@@ -398,7 +402,10 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       const configuredMark = isLocalBackend ? '<span title="Listed as Local User Backend">✓</span>' : '';
       const valid = availableSet.has(tag);
       const badge = valid ? '' : '<span class="badge badge-bad">Not available in PNYX</span>';
-      tbody.insertAdjacentHTML('beforeend', `<tr><td>${escapeHtml(tag)}${badge}</td><td style="text-align:center">${configuredMark}</td><td>${escapeHtml(m.endpoint)}</td><td>${escapeHtml(m.model_name)}</td><td>${escapeHtml(m.custom_api_path || '')}</td><td>${escapeHtml(Object.keys(m.custom_headers || {}).join(', '))}</td><td><button onclick="removeModel('${escapeHtml(tag)}')">Remove</button></td></tr>`);
+      const removeCell = currentConfig && currentConfig.read_only
+        ? ''
+        : `<td><button onclick="removeModel('${escapeHtml(tag)}')">Remove</button></td>`;
+      tbody.insertAdjacentHTML('beforeend', `<tr><td>${escapeHtml(tag)}${badge}</td><td style="text-align:center">${configuredMark}</td><td>${escapeHtml(m.endpoint)}</td><td>${escapeHtml(m.model_name)}</td><td>${escapeHtml(m.custom_api_path || '')}</td><td>${escapeHtml(Object.keys(m.custom_headers || {}).join(', '))}</td>${removeCell}</tr>`);
     }
 
     const externalTbody = document.querySelector('#external-models-table tbody');
@@ -442,8 +449,8 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       const r = await fetch('/api/stats');
       const d = await r.json();
       document.getElementById('stats').innerHTML = `
-        <b>Local:</b> ${d.local.count} reqs, avg ${d.local.avg_ms}ms<br>
-        <b>PNYX:</b> ${d.pnyx.count} reqs, avg ${d.pnyx.avg_ms}ms
+        <b>Local:</b> ${d.local.count} reqs, avg ${d.local.avg_ms} ms<br>
+        <b>PNYX:</b> ${d.pnyx.count} reqs, avg ${d.pnyx.avg_ms} ms
       `;
     } catch (e) { console.error(e); }
   }
@@ -492,11 +499,30 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     }
   }
 
+  function applyReadOnly(readOnly) {
+    const badge = document.getElementById('readonly-badge');
+    const tokenRow = document.getElementById('token-row');
+    const tokenHelpRow = document.getElementById('token-help-row');
+    const saveFallbackBtn = document.getElementById('save-fallback-btn');
+    const fallbackEnabled = document.getElementById('fallback-enabled');
+    const fallbackModel = document.getElementById('fallback-model');
+    const addSection = document.getElementById('add-model-section');
+
+    badge.style.display = readOnly ? 'inline-block' : 'none';
+    tokenRow.classList.toggle('hide-readonly', readOnly);
+    tokenHelpRow.classList.toggle('hide-readonly', readOnly);
+    saveFallbackBtn.classList.toggle('hide-readonly', readOnly);
+    addSection.classList.toggle('hide-readonly', readOnly);
+    fallbackEnabled.disabled = readOnly;
+    fallbackModel.disabled = readOnly;
+  }
+
   async function loadConfig() {
     try {
       const [cfgR, availR] = await Promise.all([fetch('/api/config'), fetch('/api/available_models')]);
       const d = await cfgR.json();
       currentConfig = d;
+      applyReadOnly(!!d.read_only);
       const availD = await availR.json();
       availableModels = availD.models || [];
       updateTagDropdown();
@@ -657,7 +683,7 @@ async fn api_refresh_models(State(state): State<WebState>) -> Result<StatusCode,
             Ok(StatusCode::OK)
         }
         Err(e) => {
-            tracing::warn!("Failed to refresh available models: {}", e);
+            tracing::warn!("Failed to refresh available models signatures: {}", e);
             Err(StatusCode::BAD_GATEWAY)
         }
     }
@@ -669,6 +695,11 @@ async fn api_refresh_models(State(state): State<WebState>) -> Result<StatusCode,
 async fn api_config(State(state): State<WebState>) -> Json<serde_json::Value> {
     let locked = state.read().await;
     let mut cfg = serde_json::to_value(&locked.config).unwrap_or_default();
+
+    // Expose read-only mode (field is `serde(skip)`ped, so add it manually)
+    if let Some(obj) = cfg.as_object_mut() {
+        obj.insert("read_only".to_string(), json!(locked.config.read_only));
+    }
 
     // Mask tokens for the UI
     if let Some(pnyx) = cfg.get_mut("pnyx") {
@@ -723,6 +754,10 @@ async fn api_config_update(
     Json(payload): Json<ConfigUpdate>,
 ) -> Result<StatusCode, StatusCode> {
     let mut locked = state.write().await;
+    if locked.config.read_only {
+        tracing::warn!("Rejected config update: running in read-only mode");
+        return Err(StatusCode::FORBIDDEN);
+    }
     let mut service_changed = false;
 
     if let Some(token) = payload.pnyx_access_token {
@@ -751,7 +786,7 @@ async fn api_config_update(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // If base_url or service_name changed, re-fetch available models
+    // If base_url or service_name changed, re-fetch available models signatures
     if service_changed {
         let pnyx_config = locked.config.pnyx.clone();
         let client = locked.client.clone();
@@ -763,7 +798,7 @@ async fn api_config_update(
                 locked.available_models = models;
             }
             Err(e) => {
-                tracing::warn!("Failed to re-fetch available models after config change: {}", e);
+                tracing::warn!("Failed to re-fetch available models signatures after config change: {}", e);
             }
         }
     }
@@ -789,6 +824,10 @@ async fn api_models_update(
     Json(payload): Json<ModelUpdate>,
 ) -> Result<StatusCode, StatusCode> {
     let mut locked = state.write().await;
+    if locked.config.read_only {
+        tracing::warn!("Rejected models update: running in read-only mode");
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     match payload.action.as_str() {
         "add" => {
