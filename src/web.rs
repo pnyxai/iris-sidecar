@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{Html, Json},
     routing::{get, post},
@@ -47,6 +47,7 @@ pub fn build_router(state: WebState) -> Router {
         .route("/api/stats", get(api_stats))
         .route("/api/available_models", get(api_available_models))
         .route("/api/v1_models", get(api_v1_models))
+        .route("/api/client_config", get(api_client_config))
         .route("/api/refresh_models", post(api_refresh_models))
         .route("/api/config", get(api_config).post(api_config_update))
         .route("/api/models", post(api_models_update))
@@ -154,6 +155,13 @@ pub async fn fetch_available_models(
 // Fetch OpenAI-style /v1/models list from PNYX gateway
 // ──────────────────────────────────────────────────────────────
 async fn api_v1_models(State(state): State<WebState>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let body = fetch_v1_models_body(&state).await?;
+    Ok(Json(body))
+}
+
+// Shared helper: fetch the OpenAI-style /v1/models body from the PNYX gateway,
+// advertising healthy local suppliers the same way the relay does.
+async fn fetch_v1_models_body(state: &WebState) -> Result<serde_json::Value, StatusCode> {
     let (client, gateway_url, access_token, local_suppliers) = {
         let guard = state.read().await;
         let healthy: Vec<String> = guard
@@ -187,7 +195,7 @@ async fn api_v1_models(State(state): State<WebState>) -> Result<Json<serde_json:
                 return Err(StatusCode::BAD_GATEWAY);
             }
             match resp.json::<serde_json::Value>().await {
-                Ok(body) => Ok(Json(body)),
+                Ok(body) => Ok(body),
                 Err(e) => {
                     tracing::warn!("Failed to parse /v1/models response: {}", e);
                     Err(StatusCode::BAD_GATEWAY)
@@ -199,6 +207,126 @@ async fn api_v1_models(State(state): State<WebState>) -> Result<Json<serde_json:
             Err(StatusCode::BAD_GATEWAY)
         }
     }
+}
+
+// ──────────────────────────────────────────────────────────────
+// API: /api/client_config?platform=opencode|hermes
+// Renders a ready-to-paste config block for third-party clients.
+// Secrets are never included: when iris.token is set, a placeholder is used.
+// ──────────────────────────────────────────────────────────────
+#[derive(Debug, Deserialize)]
+struct ClientConfigQuery {
+    platform: String,
+}
+
+async fn api_client_config(
+    State(state): State<WebState>,
+    Query(q): Query<ClientConfigQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let bad = |code: StatusCode, msg: String| {
+        tracing::warn!("client_config request failed: {}", msg);
+        (code, Json(json!({ "error": msg })))
+    };
+
+    let (iris_port, token_configured) = {
+        let guard = state.read().await;
+        (guard.config.iris.port, guard.config.iris.token.is_some())
+    };
+
+    let body = fetch_v1_models_body(&state)
+        .await
+        .map_err(|code| bad(code, "Failed to fetch model list from PNYX gateway".to_string()))?;
+
+    // Live gateway list is the single source of truth: healthy local models are
+    // included because the fetch advertises them via Pnyx-Local-Suppliers.
+    let mut seen = std::collections::HashSet::new();
+    let mut models: Vec<String> = Vec::new();
+    if let Some(arr) = body.get("data").and_then(|d| d.as_array()) {
+        for m in arr {
+            if let Some(id) = m.get("id").and_then(|v| v.as_str()) {
+                if seen.insert(id.to_string()) {
+                    models.push(id.to_string());
+                }
+            }
+        }
+    }
+
+    let base_url = format!("http://localhost:{}/v1", iris_port);
+    let default_model = if models.iter().any(|m| m == "PNYX/pocket_network") {
+        "PNYX/pocket_network".to_string()
+    } else if let Some(first) = models.first() {
+        first.clone()
+    } else {
+        "<model-id>".to_string()
+    };
+
+    let content = match q.platform.as_str() {
+        "opencode" => render_opencode_config(&base_url, &models, &default_model, token_configured),
+        "hermes" => render_hermes_config(&base_url, &models, &default_model, token_configured),
+        other => return Err(bad(StatusCode::BAD_REQUEST, format!("Unknown platform '{}'", other))),
+    };
+
+    Ok(Json(json!({
+        "platform": q.platform,
+        "content": content,
+        "model_count": models.len(),
+    })))
+}
+
+fn render_opencode_config(base_url: &str, models: &[String], default_model: &str, token_configured: bool) -> String {
+    let provider_id = "pnyx-iris";
+    let mut models_json = serde_json::Map::new();
+    for id in models {
+        models_json.insert(id.clone(), json!({ "name": id }));
+    }
+
+    let mut options = serde_json::Map::new();
+    options.insert("baseURL".to_string(), json!(base_url));
+    if token_configured {
+        options.insert("apiKey".to_string(), json!("<YOUR-IRIS-TOKEN>"));
+    }
+
+    let mut provider = serde_json::Map::new();
+    provider.insert("npm".to_string(), json!("@ai-sdk/openai-compatible"));
+    provider.insert("name".to_string(), json!("PNYX Iris Sidecar"));
+    provider.insert("options".to_string(), serde_json::Value::Object(options));
+    provider.insert("models".to_string(), serde_json::Value::Object(models_json));
+
+    let value = json!({
+        "$schema": "https://opencode.ai/config.json",
+        "provider": {
+            provider_id: serde_json::Value::Object(provider),
+        },
+        "model": format!("{}/{}", provider_id, default_model),
+    });
+
+    let mut out = String::new();
+    out.push_str(&serde_json::to_string_pretty(&value).unwrap_or_default());
+    out.push('\n');
+    out
+}
+
+fn render_hermes_config(base_url: &str, models: &[String], default_model: &str, token_configured: bool) -> String {
+    let mut out = String::new();
+    out.push_str("# Paste into Hermes config.yaml\n");
+    out.push_str("# Points to the local Iris sidecar (serves gateway + healthy local models)\n");
+    out.push_str("custom_providers:\n");
+    out.push_str("  - name: Iris (PNYX Sidecar)\n");
+    out.push_str(&format!("    base_url: {}\n", base_url));
+    if token_configured {
+        out.push_str("    api_key: \"<YOUR-IRIS-TOKEN>\"  # Replace with iris.token from config.yaml\n");
+    }
+    out.push_str(&format!("    model: {}\n", default_model));
+    out.push_str("    api_mode: chat_completions\n");
+    out.push_str("    models:\n");
+    if models.is_empty() {
+        out.push_str("      {}  # No models returned by the gateway\n");
+    } else {
+        for id in models {
+            out.push_str(&format!("      \"{}\": {{}}\n", id));
+        }
+    }
+    out
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -322,6 +450,26 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     <tbody></tbody>
   </table>
 </div>
+
+
+<div class="card">
+  <h2>Client Config</h2>
+  <div class="row">
+    <label for="client-platform">Platform:</label>
+    <select id="client-platform" onchange="resetClientConfig()">
+      <option value="opencode">OpenCode (opencode.json)</option>
+      <option value="hermes">Hermes (config.yaml)</option>
+    </select>
+    <button id="generate-btn" onclick="loadClientConfig()">Generate</button>
+    <button id="copy-btn" onclick="copyClientConfig()" disabled>Copy</button>
+    <span id="copy-feedback" style="color: var(--good); display:none">Copied!</span>
+  </div>
+  <div class="row" style="font-size: 0.85rem; color: #8b949e; margin-top: -0.3rem;">
+    Generated live from the gateway: only models healthy right now (see Local Models Health) are included. Paste into the tool's config file. If it contains <span class="mono">&lt;YOUR-IRIS-TOKEN&gt;</span>, replace it with the iris.token from config.yaml.
+  </div>
+  <pre id="client-config-out" class="mono" style="background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:0.8rem; overflow:auto; max-height:400px; white-space:pre; margin:0;">Check your local models' health above, then click Generate.</pre>
+</div>
+
 
 <script>
   let availableModels = [];
@@ -592,6 +740,70 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     const r = await fetch('/api/models', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({action:'remove', tag}) });
     if (r.ok) { showMsg('Model removed'); await loadConfig(); }
     else showMsg('Failed to remove model', false);
+  }
+
+  let clientConfigText = '';
+
+  function resetClientConfig() {
+    clientConfigText = '';
+    document.getElementById('copy-btn').disabled = true;
+    document.getElementById('client-config-out').textContent = 'Check your local models\' health above, then click Generate.';
+  }
+
+  async function loadClientConfig() {
+    const out = document.getElementById('client-config-out');
+    const btn = document.getElementById('generate-btn');
+    const copyBtn = document.getElementById('copy-btn');
+    const platform = document.getElementById('client-platform').value;
+    btn.disabled = true;
+    btn.textContent = 'Generating...';
+    copyBtn.disabled = true;
+    clientConfigText = '';
+    out.textContent = 'Fetching live model list from the gateway...';
+    try {
+      const r = await fetch('/api/client_config?platform=' + encodeURIComponent(platform));
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+      clientConfigText = d.content || '';
+      out.textContent = clientConfigText;
+      copyBtn.disabled = !clientConfigText;
+    } catch (e) {
+      clientConfigText = '';
+      out.textContent = 'Failed to generate config: ' + e.message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Generate';
+    }
+  }
+
+  function copyClientConfig() {
+    if (!clientConfigText) return showMsg('Nothing to copy yet', false);
+    const done = () => {
+      const fb = document.getElementById('copy-feedback');
+      fb.style.display = 'inline';
+      setTimeout(() => fb.style.display = 'none', 2000);
+    };
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(clientConfigText).then(done).catch(() => legacyCopy(clientConfigText, done));
+    } else {
+      legacyCopy(clientConfigText, done);
+    }
+  }
+
+  function legacyCopy(text, done) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand('copy');
+      done();
+    } catch (e) {
+      showMsg('Copy failed', false);
+    }
+    document.body.removeChild(ta);
   }
 
   loadHealth(); loadStats(); loadConfig();
