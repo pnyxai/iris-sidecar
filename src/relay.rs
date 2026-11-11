@@ -136,7 +136,7 @@ const JSON_USAGE_CAP: usize = 1024 * 1024 * 10;
 struct LocalGenContext {
     metrics: Arc<Metrics>,
     client: Client,
-    gateway_base: String,
+    gateway_traces_url: String,
     access_token: String,
     model_tag: String,
     local_call_start: Instant,
@@ -391,7 +391,7 @@ fn build_usage_payload(
 }
 
 /// Report locally-generated usage/timings to the gateway via a fire-and-forget
-/// `POST /traces/<id>/update-usage`. Correlation is the trace id only; without
+/// `POST /<id>/update-usage`. Correlation is the trace id only; without
 /// it the report is unmatchable → warn + skip.
 fn report_local_usage(ctx: &LocalGenContext, payload: serde_json::Value) {
     let trace = match ctx.trace_router.as_deref() {
@@ -405,8 +405,8 @@ fn report_local_usage(ctx: &LocalGenContext, payload: serde_json::Value) {
         }
     };
     let url = format!(
-        "{}/traces/{}/update-usage",
-        ctx.gateway_base.trim_end_matches('/'),
+        "{}/{}/update-usage",
+        ctx.gateway_traces_url.trim_end_matches('/'),
         trace
     );
 
@@ -423,10 +423,21 @@ fn report_local_usage(ctx: &LocalGenContext, payload: serde_json::Value) {
             .await;
         match result {
             Ok(resp) => {
-                tracing::debug!("usage report POST -> HTTP {}", resp.status());
+                let status = resp.status();
+                if status == reqwest::StatusCode::OK {
+                    tracing::debug!("usage report POST -> HTTP {}", status);
+                } else {
+                    let body = resp.text().await.unwrap_or_default();
+                    tracing::warn!(
+                        "usage report POST on {} returned non-200 ({}): {}",
+                        url,
+                        status,
+                        body
+                    );
+                }
             }
             Err(e) => {
-                tracing::warn!("usage report POST failed: {}", e);
+                tracing::warn!("usage report POST on {} failed: {}", url, e);
             }
         }
     });
@@ -498,7 +509,7 @@ async fn try_fallback(
     body_bytes: &bytes::Bytes,
     healthy: &[String],
     metrics: &Arc<Metrics>,
-    gateway_insights: &str,
+    gateway_traces_url: &str,
     access_token: &str,
     trace_router: Option<String>,
     routing_ms: Option<u64>,
@@ -540,7 +551,7 @@ async fn try_fallback(
     let ctx = LocalGenContext {
         metrics: metrics.clone(),
         client: client.clone(),
-        gateway_base: gateway_insights.to_string(),
+        gateway_traces_url: gateway_traces_url.to_string(),
         access_token: access_token.to_string(),
         model_tag: model.model_tag.clone(),
         local_call_start,
@@ -626,7 +637,7 @@ pub async fn relay(
     // ── Step 3: Prepare the request to the PNYX gateway ──
     let gateway_url = config.pnyx.gateway_relay_url();
     let gateway_base = gateway_url.trim_end_matches('/').to_string();
-    let gateway_insights_url = config.pnyx.gateway_insights_url();
+    let gateway_traces_url = config.pnyx.gateway_traces_url();
     let upstream_url = format!("{}{}{}", gateway_base, path, query);
 
     // Start with a fresh header map for the upstream request
@@ -713,7 +724,7 @@ pub async fn relay(
                     &body_bytes,
                     &healthy,
                     &metrics,
-                    &gateway_insights_url,
+                    &gateway_traces_url,
                     &config.pnyx.access_token,
                     None,
                     None,
@@ -783,7 +794,7 @@ pub async fn relay(
                 &body_bytes,
                 &healthy,
                 &metrics,
-                &gateway_base,
+                &gateway_traces_url,
                 &config.pnyx.access_token,
                 trace_router.clone(),
                 routing_ms,
@@ -882,7 +893,7 @@ pub async fn relay(
     let ctx = LocalGenContext {
         metrics: metrics.clone(),
         client: client.clone(),
-        gateway_base: gateway_insights_url.clone(),
+        gateway_traces_url: gateway_traces_url.clone(),
         access_token: config.pnyx.access_token.clone(),
         model_tag: relay_data.model_tag.clone(),
         local_call_start,
@@ -927,7 +938,7 @@ mod tests {
         LocalGenContext {
             metrics,
             client: reqwest::Client::new(),
-            gateway_base: "https://gw.example".to_string(),
+            gateway_traces_url: "https://gw.example".to_string(),
             access_token: "tok".to_string(),
             model_tag: "m".to_string(),
             local_call_start: Instant::now(),

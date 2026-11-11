@@ -64,6 +64,9 @@ impl PnyxConfig {
     pub fn gateway_insights_url(&self) -> String {
         format!("{}/insights", self.base_url.trim_end_matches('/'))
     }
+    pub fn gateway_traces_url(&self) -> String {
+        format!("{}/traces", self.base_url.trim_end_matches('/'))
+    }
 }
 
 // ──────────────────────────────────────────────────────────────

@@ -110,8 +110,8 @@ pub async fn fetch_available_models(
     pnyx_config: &PnyxConfig,
 ) -> Result<Vec<String>, reqwest::Error> {
     let url = format!(
-        "{}/insights/models?service={}",
-        pnyx_config.base_url.trim_end_matches('/'),
+        "{}/models?service={}",
+        pnyx_config.gateway_insights_url(),
         pnyx_config.service_name
     );
     let resp = client
