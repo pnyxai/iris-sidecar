@@ -58,8 +58,11 @@ pub struct PnyxConfig {
 
 impl PnyxConfig {
     /// Build the full gateway URL: {base_url}/relay/{service_name}
-    pub fn gateway_url(&self) -> String {
+    pub fn gateway_relay_url(&self) -> String {
         format!("{}/relay/{}", self.base_url.trim_end_matches('/'), self.service_name)
+    }
+    pub fn gateway_insights_url(&self) -> String {
+        format!("{}/insights", self.base_url.trim_end_matches('/'))
     }
 }
 

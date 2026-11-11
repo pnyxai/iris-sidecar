@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::config::{Config, FallbackConfig, PnyxConfig};
-use crate::models::{LocalModel, Metrics};
+use crate::models::{FieldStats, LocalModel, Metrics};
 
 // ──────────────────────────────────────────────────────────────
 // Shared state (mirrors relay.rs, but mutable)
@@ -31,7 +31,7 @@ pub struct SharedState {
     pub models: HashMap<String, LocalModel>,
     pub model_health: HashMap<String, bool>,
     pub last_health_check: Option<Instant>,
-    pub metrics: Metrics,
+    pub metrics: Arc<Metrics>,
     pub available_models: Vec<String>,
 }
 
@@ -172,7 +172,7 @@ async fn fetch_v1_models_body(state: &WebState) -> Result<serde_json::Value, Sta
             .collect();
         (
             guard.client.clone(),
-            guard.config.pnyx.gateway_url(),
+            guard.config.pnyx.gateway_relay_url(),
             guard.config.pnyx.access_token.clone(),
             healthy.join(","),
         )
@@ -596,9 +596,20 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     try {
       const r = await fetch('/api/stats');
       const d = await r.json();
+      const ign = (n) => n && n.ignored > 0 ? ' <span style="color:#e3b341">(' + n.ignored + ' ignored)</span>' : '';
+      const u = d.local.usage || {};
+      const t = d.local.timings || {};
+      const tok = 'in ' + (u.prompt_tokens ? u.prompt_tokens.total.toLocaleString() + ign(u.prompt_tokens) : '0')
+        + ' · out ' + (u.completion_tokens ? u.completion_tokens.total.toLocaleString() + ign(u.completion_tokens) : '0')
+        + ' · cached ' + (u.cached_tokens ? u.cached_tokens.total.toLocaleString() + ign(u.cached_tokens) : '0');
+      const tim = 'routing ' + (t.routing_ms ? t.routing_ms.avg + ' ms' + ign(t.routing_ms) : '—')
+        + ' · TTFT ' + (t.ttft_ms ? t.ttft_ms.avg + ' ms' + ign(t.ttft_ms) : '—')
+        + ' · generation ' + (t.generation_ms ? t.generation_ms.avg + ' ms' + ign(t.generation_ms) : '—');
       document.getElementById('stats').innerHTML = `
         <b>Local:</b> ${d.local.count} reqs, avg ${d.local.avg_ms} ms<br>
-        <b>PNYX:</b> ${d.pnyx.count} reqs, avg ${d.pnyx.avg_ms} ms
+        <b>PNYX:</b> ${d.pnyx.count} reqs, avg ${d.pnyx.avg_ms} ms<br>
+        <b>Tokens (since start):</b> ${tok}<br>
+        <b>Timings (since start):</b> ${tim}
       `;
     } catch (e) { console.error(e); }
   }
@@ -855,6 +866,14 @@ fn format_ago(secs: u64) -> String {
 // ──────────────────────────────────────────────────────────────
 // API: /api/stats
 // ──────────────────────────────────────────────────────────────
+fn stat_json(f: FieldStats) -> serde_json::Value {
+    json!({
+        "total": f.total,
+        "avg": f.avg(),
+        "ignored": f.ignored,
+    })
+}
+
 async fn api_stats(State(state): State<WebState>) -> Json<serde_json::Value> {
     let locked = state.read().await;
     let (local_count, local_total) = locked.metrics.local_stats();
@@ -863,8 +882,24 @@ async fn api_stats(State(state): State<WebState>) -> Json<serde_json::Value> {
     let local_avg = if local_count > 0 { local_total / local_count } else { 0 };
     let pnyx_avg = if pnyx_count > 0 { pnyx_total / pnyx_count } else { 0 };
 
+    let usage = json!({
+        "prompt_tokens": stat_json(locked.metrics.prompt_tokens_stats()),
+        "completion_tokens": stat_json(locked.metrics.completion_tokens_stats()),
+        "cached_tokens": stat_json(locked.metrics.cached_tokens_stats()),
+    });
+    let timings = json!({
+        "routing_ms": stat_json(locked.metrics.routing_stats()),
+        "ttft_ms": stat_json(locked.metrics.ttft_stats()),
+        "generation_ms": stat_json(locked.metrics.generation_stats()),
+    });
+
     Json(json!({
-        "local": { "count": local_count, "avg_ms": local_avg },
+        "local": {
+            "count": local_count,
+            "avg_ms": local_avg,
+            "usage": usage,
+            "timings": timings,
+        },
         "pnyx": { "count": pnyx_count, "avg_ms": pnyx_avg },
     }))
 }

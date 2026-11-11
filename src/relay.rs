@@ -18,7 +18,9 @@
 // ──────────────────────────────────────────────────────────────
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 // ── Axum (web framework) imports ──
@@ -35,9 +37,10 @@ use http_body_util::BodyExt;
 use rand::seq::SliceRandom;
 use reqwest::Client; // The HTTP client we use to call the gateway and local models
 use serde_json::json; // For picking a random healthy model
+use futures_core::Stream; // For the pass-through usage-tracking body stream
 
 use crate::config::Config;
-use crate::models::{LocalModel, RelayData};
+use crate::models::{LocalModel, Metrics, RelayData};
 use crate::web::SharedState;
 
 // ──────────────────────────────────────────────────────────────
@@ -116,6 +119,320 @@ fn stream_reqwest_response(resp: reqwest::Response) -> Response {
 }
 
 // ──────────────────────────────────────────────────────────────
+// Local-generation usage/timing tracking
+// ──────────────────────────────────────────────────────────────
+// Everything below inspects a LOCAL model response (streaming or not)
+// to extract OpenAI `usage` + generation timings and (eventually) report
+// them to the gateway. Gateway-passthrough responses never use this.
+
+/// Max bytes we buffer when inspecting a non-streaming JSON body to find
+/// `usage` (forwarded to the client regardless). OpenAI puts `usage` at the
+/// end, so 10 MiB is generous; beyond it we give up parsing and mark tokens
+/// absent (ignore-me) rather than hold the whole body.
+const JSON_USAGE_CAP: usize = 1024 * 1024 * 10;
+
+/// Everything the response tee needs to record metrics and (later) report
+/// to the gateway. Cheap to clone/move into the body stream.
+struct LocalGenContext {
+    metrics: Arc<Metrics>,
+    client: Client,
+    gateway_base: String,
+    access_token: String,
+    model_tag: String,
+    local_call_start: Instant,
+    routing_ms: Option<u64>,
+    trace_router: Option<String>,
+}
+
+/// A pass-through `Stream` that forwards every byte chunk to the client
+/// unchanged (no added latency / no full buffering for SSE) while
+/// incrementally sniffing out the OpenAI `usage` object and the time of the
+/// first generated token. Records metrics + builds the report when the
+/// response ends, errors, or is dropped (client disconnect) — exactly once.
+struct UsageTeeStream<S> {
+    inner: Pin<Box<S>>,
+    ctx: LocalGenContext,
+    is_sse: bool,
+    status_code: u16,
+    line_buf: Vec<u8>,       // SSE: partial line across chunk boundaries
+    json_buf: Vec<u8>,       // non-streaming: buffered body (capped)
+    json_overflow: bool,     // body exceeded JSON_USAGE_CAP
+    usage: Option<serde_json::Value>, // last `usage` object seen (SSE)
+    ttft_ms: Option<u64>,    // time of first content token vs local_call_start
+    finalized: bool,
+}
+
+impl<S> UsageTeeStream<S> {
+    fn new(body: S, ctx: LocalGenContext, is_sse: bool, status_code: u16) -> Self {
+        UsageTeeStream {
+            inner: Box::pin(body),
+            ctx,
+            is_sse,
+            status_code,
+            line_buf: Vec::new(),
+            json_buf: Vec::new(),
+            json_overflow: false,
+            usage: None,
+            ttft_ms: None,
+            finalized: false,
+        }
+    }
+
+    /// Feed a raw chunk. Bytes were already (or will be) forwarded to the
+    /// client by `poll`; here we only observe them.
+    fn consume(&mut self, bytes: &[u8], now: Instant) {
+        if self.is_sse {
+            self.line_buf.extend_from_slice(bytes);
+            while let Some(pos) = self.line_buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.line_buf.drain(..=pos).collect();
+                self.handle_sse_line(&line, now);
+            }
+            // Defensive: a pathological "line" with no newline must not grow forever.
+            if self.line_buf.len() > JSON_USAGE_CAP {
+                self.line_buf.clear();
+            }
+        } else if !self.json_overflow {
+            if self.json_buf.len() + bytes.len() <= JSON_USAGE_CAP {
+                self.json_buf.extend_from_slice(bytes);
+            } else {
+                self.json_overflow = true;
+            }
+        }
+    }
+
+    fn handle_sse_line(&mut self, line: &[u8], now: Instant) {
+        let s = String::from_utf8_lossy(line);
+        let s = s.trim_end_matches(['\r', '\n']);
+        let data = match s.strip_prefix("data:") {
+            Some(d) => d.trim(),
+            None => return, // ignore `event:`, comments (`:`), blanks
+        };
+        if data == "[DONE]" {
+            return;
+        }
+        let v: serde_json::Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if self.ttft_ms.is_none() && first_token_present(&v) {
+            self.ttft_ms = Some(now.duration_since(self.ctx.local_call_start).as_millis() as u64);
+        }
+        if let Some(u) = v.get("usage") {
+            if !u.is_null() {
+                self.usage = Some(u.clone());
+            }
+        }
+    }
+
+    /// Finalize exactly once: record usage + timings and fire the report.
+    fn finalize(&mut self) {
+        if self.finalized {
+            return;
+        }
+        self.finalized = true;
+
+        let generation_ms = Some(Instant::now().duration_since(self.ctx.local_call_start).as_millis() as u64);
+
+        // Resolve the usage object: SSE captured it incrementally; for a
+        // non-streaming body we parse the (capped) buffer now.
+        let usage_val = if self.is_sse {
+            self.usage.take()
+        } else if !self.json_overflow {
+            serde_json::from_slice::<serde_json::Value>(&self.json_buf)
+                .ok()
+                .and_then(|v| v.get("usage").cloned())
+        } else {
+            None
+        };
+        let (prompt, completion, cached) = extract_usage(usage_val.as_ref());
+
+        // Tokens are recorded on every local generation (decision #1).
+        self.ctx.metrics.record_local_usage(prompt, completion, cached);
+
+        // If the gateway never sent a trace id we cannot correlate the report,
+        // so record ALL times as ignore-me (-1); otherwise record measured ones.
+        let (routing, ttft, gen) = if self.ctx.trace_router.is_some() {
+            (self.ctx.routing_ms, self.ttft_ms, generation_ms)
+        } else {
+            (None, None, None)
+        };
+        self.ctx.metrics.record_local_times(routing, ttft, gen);
+
+        let payload = build_usage_payload(prompt, completion, cached, ttft, gen, self.status_code);
+        report_local_usage(&self.ctx, payload);
+
+        // Release buffers promptly (they may be sizable).
+        self.line_buf = Vec::new();
+        self.json_buf = Vec::new();
+    }
+}
+
+impl<S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + 'static> Stream for UsageTeeStream<S> {
+    type Item = Result<bytes::Bytes, reqwest::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let me = self.get_mut();
+        match me.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                let now = Instant::now();
+                me.consume(&bytes, now);
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                me.finalize();
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                me.finalize();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S> Drop for UsageTeeStream<S> {
+    fn drop(&mut self) {
+        // Covers client disconnects / early drops where `poll` never reaches
+        // the terminal `None`/`Err`. `finalize` is idempotent.
+        self.finalize();
+    }
+}
+
+/// Like `stream_reqwest_response`, but wraps the body in a usage-tracking tee.
+/// Only used for LOCAL model responses (fallback + gateway-directed-local).
+fn stream_local_response(resp: reqwest::Response, ctx: LocalGenContext) -> Response {
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+    let status_code = resp.status().as_u16();
+    let is_sse = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_ascii_lowercase().contains("text/event-stream"))
+        .unwrap_or(false);
+
+    let mut builder = Response::builder().status(status);
+    for (key, value) in resp.headers() {
+        let key_str = key.as_str().to_lowercase();
+        if key_str == "content-length" || key_str == "transfer-encoding" {
+            continue;
+        }
+        builder = builder.header(key.as_str(), value.as_bytes());
+    }
+
+    let body = Body::from_stream(UsageTeeStream::new(resp.bytes_stream(), ctx, is_sse, status_code));
+    builder.body(body).unwrap()
+}
+
+/// True if an SSE chunk carries the first generated token (non-empty delta /
+/// message content, tool calls, or completions-style text). The leading
+/// role-only delta (empty content) is correctly treated as *not* a token.
+fn first_token_present(v: &serde_json::Value) -> bool {
+    let arr = match v.get("choices").and_then(|c| c.as_array()) {
+        Some(a) => a,
+        None => return false,
+    };
+    for ch in arr {
+        let delta = ch.get("delta").or_else(|| ch.get("message"));
+        let has_content = delta
+            .and_then(|d| d.get("content"))
+            .and_then(|c| c.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let has_tool = delta.and_then(|d| d.get("tool_calls")).is_some();
+        let has_text = ch
+            .get("text")
+            .and_then(|t| t.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if has_content || has_tool || has_text {
+            return true;
+        }
+    }
+    false
+}
+
+/// Pull the three canonical OpenAI token counts; each is `None` when absent.
+fn extract_usage(usage: Option<&serde_json::Value>) -> (Option<u64>, Option<u64>, Option<u64>) {
+    match usage {
+        Some(u) => {
+            let prompt = u.get("prompt_tokens").and_then(|n| n.as_u64());
+            let completion = u.get("completion_tokens").and_then(|n| n.as_u64());
+            let cached = u
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|n| n.as_u64());
+            (prompt, completion, cached)
+        }
+        None => (None, None, None),
+    }
+}
+
+/// Build the gateway report payload. Ignore-me (`None`) fields become `-1`;
+/// `cache_creation_tokens` has no OpenAI source and is always `-1`.
+fn build_usage_payload(
+    prompt: Option<u64>,
+    completion: Option<u64>,
+    cached: Option<u64>,
+    ttft: Option<u64>,
+    generation: Option<u64>,
+    status_code: u16,
+) -> serde_json::Value {
+    let i = |v: Option<u64>| v.map(|x| x as i64).unwrap_or(-1);
+    json!({
+        "prompt_tokens": i(prompt),
+        "completion_tokens": i(completion),
+        "cached_tokens": i(cached),
+        "cache_creation_tokens": -1,
+        "time_to_first_token_ms": i(ttft),
+        "total_generation_time_ms": i(generation),
+        "status_code": status_code,
+    })
+}
+
+/// Report locally-generated usage/timings to the gateway via a fire-and-forget
+/// `POST /traces/<id>/update-usage`. Correlation is the trace id only; without
+/// it the report is unmatchable → warn + skip.
+fn report_local_usage(ctx: &LocalGenContext, payload: serde_json::Value) {
+    let trace = match ctx.trace_router.as_deref() {
+        Some(t) => t,
+        None => {
+            tracing::warn!(
+                model_tag = %ctx.model_tag,
+                "Pnyx-Trace-Router absent; skipped usage report (all times recorded as -1)"
+            );
+            return;
+        }
+    };
+    let url = format!(
+        "{}/traces/{}/update-usage",
+        ctx.gateway_base.trim_end_matches('/'),
+        trace
+    );
+
+    // Fire-and-forget report.
+    let client = ctx.client.clone();
+    let token = ctx.access_token.clone();
+    tokio::spawn(async move {
+        let result = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Pnyx-Sidecar-Request", "true")
+            .json(&payload)
+            .send()
+            .await;
+        match result {
+            Ok(resp) => {
+                tracing::debug!("usage report POST -> HTTP {}", resp.status());
+            }
+            Err(e) => {
+                tracing::warn!("usage report POST failed: {}", e);
+            }
+        }
+    });
+}
+
+// ──────────────────────────────────────────────────────────────
 // call_local_model
 // ──────────────────────────────────────────────────────────────
 // Sends a JSON payload to a local model, overriding the `model` field
@@ -172,6 +489,7 @@ fn should_fallback(config: &Config, healthy: &[String]) -> bool {
 // fallback configuration ("random" or a specific tag) and returns
 // the local model's response streamed back to the user.
 // ──────────────────────────────────────────────────────────────
+#[allow(clippy::too_many_arguments)]
 async fn try_fallback(
     config: &Config,
     models: &HashMap<String, LocalModel>,
@@ -179,6 +497,11 @@ async fn try_fallback(
     parts: &axum::http::request::Parts,
     body_bytes: &bytes::Bytes,
     healthy: &[String],
+    metrics: &Arc<Metrics>,
+    gateway_insights: &str,
+    access_token: &str,
+    trace_router: Option<String>,
+    routing_ms: Option<u64>,
 ) -> Result<Response, StatusCode> {
     let fallback_cfg = config.iris.fallback.as_ref().unwrap();
 
@@ -212,8 +535,19 @@ async fn try_fallback(
         StatusCode::BAD_REQUEST
     })?;
 
+    let local_call_start = Instant::now();
     let local_resp = call_local_model(client, parts, payload, model).await?;
-    Ok(stream_reqwest_response(local_resp))
+    let ctx = LocalGenContext {
+        metrics: metrics.clone(),
+        client: client.clone(),
+        gateway_base: gateway_insights.to_string(),
+        access_token: access_token.to_string(),
+        model_tag: model.model_tag.clone(),
+        local_call_start,
+        routing_ms,
+        trace_router,
+    };
+    Ok(stream_local_response(local_resp, ctx))
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -237,9 +571,14 @@ pub async fn relay(
     let start = Instant::now();
 
     // Lock briefly to read config and models, then release
-    let (config, models, client) = {
+    let (config, models, client, metrics) = {
         let guard = state.read().await;
-        (guard.config.clone(), guard.models.clone(), guard.client.clone())
+        (
+            guard.config.clone(),
+            guard.models.clone(),
+            guard.client.clone(),
+            guard.metrics.clone(),
+        )
     };
 
     // ── Step 1: Optional local authentication ──
@@ -285,8 +624,9 @@ pub async fn relay(
         .unwrap_or_default(); // Otherwise use an empty string
 
     // ── Step 3: Prepare the request to the PNYX gateway ──
-    let gateway_url = config.pnyx.gateway_url();
-    let gateway_base = gateway_url.trim_end_matches('/');
+    let gateway_url = config.pnyx.gateway_relay_url();
+    let gateway_base = gateway_url.trim_end_matches('/').to_string();
+    let gateway_insights_url = config.pnyx.gateway_insights_url();
     let upstream_url = format!("{}{}{}", gateway_base, path, query);
 
     // Start with a fresh header map for the upstream request
@@ -344,18 +684,44 @@ pub async fn relay(
         .headers(upstream_headers)
         .body(body_bytes.clone());
 
-    // Actually send the request to the gateway and wait for the response
-    let upstream_resp = match upstream_req.send().await {
-        Ok(resp) => resp,
+    // Actually send the request to the gateway and wait for the response.
+    // Routing time ends the moment we receive the gateway's trace-id header;
+    // `trace_router` is also the sole correlation key for the usage report.
+    let (upstream_resp, trace_router, routing_ms) = match upstream_req.send().await {
+        Ok(resp) => {
+            let header_at = Instant::now();
+            let trace_router = resp
+                .headers()
+                .get("Pnyx-Trace-Router")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let routing_ms = trace_router
+                .as_ref()
+                .map(|_| header_at.duration_since(start).as_millis() as u64);
+            (resp, trace_router, routing_ms)
+        }
         Err(e) => {
             tracing::error!("Gateway request failed: {}", e);
             // Check if we should use the fallback
             if should_fallback(&config, &healthy) {
                 tracing::debug!("Falling back to local");
-                let resp = try_fallback(&config, &models, &client, &parts, &body_bytes, &healthy).await;
+                let resp = try_fallback(
+                    &config,
+                    &models,
+                    &client,
+                    &parts,
+                    &body_bytes,
+                    &healthy,
+                    &metrics,
+                    &gateway_insights_url,
+                    &config.pnyx.access_token,
+                    None,
+                    None,
+                )
+                .await;
                 if let Ok(ref _r) = resp {
                     let ms = start.elapsed().as_millis() as u64;
-                    state.read().await.metrics.record_local(ms);
+                    metrics.record_local(ms);
                 }
                 return resp;
             } else {
@@ -397,7 +763,7 @@ pub async fn relay(
                 "gateway_response": gateway_response
             });
             let ms = start.elapsed().as_millis() as u64;
-            state.read().await.metrics.record_pnyx(ms);
+            metrics.record_pnyx(ms);
             return Ok((status, Json(body)).into_response());
         }
 
@@ -409,16 +775,29 @@ pub async fn relay(
 
         // Check if we should use the fallback
         if should_fallback(&config, &healthy) {
-            let resp = try_fallback(&config, &models, &client, &parts, &body_bytes, &healthy).await;
+            let resp = try_fallback(
+                &config,
+                &models,
+                &client,
+                &parts,
+                &body_bytes,
+                &healthy,
+                &metrics,
+                &gateway_base,
+                &config.pnyx.access_token,
+                trace_router.clone(),
+                routing_ms,
+            )
+            .await;
             if let Ok(ref _r) = resp {
                 let ms = start.elapsed().as_millis() as u64;
-                state.read().await.metrics.record_local(ms);
+                metrics.record_local(ms);
             }
             return resp;
         } else {
             // If not, just relay the gateway error to the user
             let ms = start.elapsed().as_millis() as u64;
-            state.read().await.metrics.record_pnyx(ms);
+            metrics.record_pnyx(ms);
             return Ok(stream_reqwest_response(upstream_resp));
         }
     }
@@ -434,7 +813,7 @@ pub async fn relay(
     if !local_request {
         tracing::debug!("📦 Routing gateway response!");
         let ms = start.elapsed().as_millis() as u64;
-        state.read().await.metrics.record_pnyx(ms);
+        metrics.record_pnyx(ms);
         return Ok(stream_reqwest_response(upstream_resp));
     }
 
@@ -498,8 +877,19 @@ pub async fn relay(
     })?;
     tracing::debug!("🏠 Model: {}", relay_data.model_tag);
 
+    let local_call_start = Instant::now();
     let local_resp = call_local_model(&client, &parts, payload, model).await?;
-    let mut response = stream_reqwest_response(local_resp);
+    let ctx = LocalGenContext {
+        metrics: metrics.clone(),
+        client: client.clone(),
+        gateway_base: gateway_insights_url.clone(),
+        access_token: config.pnyx.access_token.clone(),
+        model_tag: relay_data.model_tag.clone(),
+        local_call_start,
+        routing_ms,
+        trace_router,
+    };
+    let mut response = stream_local_response(local_resp, ctx);
 
     // Inject the pnyx-* headers from the gateway into the final response
     for (key, value) in &pnyx_headers {
@@ -508,8 +898,205 @@ pub async fn relay(
 
     // Record local metrics
     let ms = start.elapsed().as_millis() as u64;
-    state.read().await.metrics.record_local(ms);
+    metrics.record_local(ms);
 
     // Response is actually written to the client here, so order of response generation and headers does not matter.
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use std::time::Instant;
+
+    // A Stream that yields nothing; the tee is driven directly via
+    // consume()/finalize() in these tests, so `inner` is never polled.
+    struct NullStream;
+    impl Stream for NullStream {
+        type Item = Result<bytes::Bytes, reqwest::Error>;
+        fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(None)
+        }
+    }
+
+    fn test_ctx(metrics: Arc<Metrics>, trace: Option<&str>) -> LocalGenContext {
+        LocalGenContext {
+            metrics,
+            client: reqwest::Client::new(),
+            gateway_base: "https://gw.example".to_string(),
+            access_token: "tok".to_string(),
+            model_tag: "m".to_string(),
+            local_call_start: Instant::now(),
+            routing_ms: Some(10),
+            trace_router: trace.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn extract_usage_reads_canonical_fields() {
+        let v = serde_json::json!({
+            "prompt_tokens": 120, "completion_tokens": 128, "total_tokens": 248,
+            "prompt_tokens_details": { "cached_tokens": 30 }
+        });
+        assert_eq!(extract_usage(Some(&v)), (Some(120), Some(128), Some(30)));
+
+        let v2 = serde_json::json!({ "prompt_tokens": 5, "completion_tokens": 6 });
+        assert_eq!(extract_usage(Some(&v2)), (Some(5), Some(6), None));
+
+        assert_eq!(extract_usage(None), (None, None, None));
+    }
+
+    #[test]
+    fn first_token_present_detects_content_variants() {
+        let role = serde_json::json!({ "choices": [{ "delta": { "role": "assistant", "content": "" } }] });
+        assert!(!first_token_present(&role));
+
+        let content = serde_json::json!({ "choices": [{ "delta": { "content": "hi" } }] });
+        assert!(first_token_present(&content));
+
+        let tools = serde_json::json!({ "choices": [{ "delta": { "tool_calls": [{ "index": 0 }] } }] });
+        assert!(first_token_present(&tools));
+
+        let text = serde_json::json!({ "choices": [{ "text": "abc" }] });
+        assert!(first_token_present(&text));
+
+        let usage_only = serde_json::json!({ "choices": [], "usage": { "prompt_tokens": 1 } });
+        assert!(!first_token_present(&usage_only));
+    }
+
+    #[test]
+    fn payload_uses_minus_one_for_ignored_and_constant_cache_creation() {
+        let p = build_usage_payload(Some(120), Some(128), None, None, Some(2000), 200);
+        assert_eq!(p["prompt_tokens"], serde_json::json!(120));
+        assert_eq!(p["completion_tokens"], serde_json::json!(128));
+        assert_eq!(p["cached_tokens"], serde_json::json!(-1));
+        assert_eq!(p["cache_creation_tokens"], serde_json::json!(-1));
+        assert_eq!(p["time_to_first_token_ms"], serde_json::json!(-1));
+        assert_eq!(p["total_generation_time_ms"], serde_json::json!(2000));
+        assert_eq!(p["status_code"], serde_json::json!(200));
+    }
+
+    #[tokio::test]
+    async fn nonstreaming_tee_records_tokens_and_ignores_ttft() {
+        let m = Arc::new(Metrics::default());
+        let mut tee = UsageTeeStream::new(NullStream, test_ctx(m.clone(), Some("trace-1")), false, 200);
+        let body =
+            br#"{"usage":{"prompt_tokens":120,"completion_tokens":128,"prompt_tokens_details":{"cached_tokens":30}}}"#;
+        tee.consume(body, Instant::now());
+        tee.finalize();
+
+        assert_eq!(m.prompt_tokens_stats().total, 120);
+        assert_eq!(m.completion_tokens_stats().total, 128);
+        assert_eq!(m.cached_tokens_stats().total, 30);
+        assert_eq!(m.ttft_stats().ignored, 1); // non-streaming -> ignore-me
+        assert_eq!(m.ttft_stats().valid, 0);
+        assert_eq!(m.routing_stats().valid, 1);
+        assert_eq!(m.generation_stats().valid, 1);
+
+        tee.finalize(); // idempotent
+        assert_eq!(m.local_observations.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn missing_trace_ignores_all_times_but_keeps_tokens() {
+        let m = Arc::new(Metrics::default());
+        let mut tee = UsageTeeStream::new(NullStream, test_ctx(m.clone(), None), false, 200);
+        let body = br#"{"usage":{"prompt_tokens":7,"completion_tokens":9}}"#;
+        tee.consume(body, Instant::now());
+        tee.finalize();
+
+        assert_eq!(m.prompt_tokens_stats().total, 7);
+        assert_eq!(m.completion_tokens_stats().total, 9);
+        assert_eq!(m.routing_stats().ignored, 1);
+        assert_eq!(m.ttft_stats().ignored, 1);
+        assert_eq!(m.generation_stats().ignored, 1);
+        assert_eq!(m.generation_stats().valid, 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_sse_split_across_chunks_captures_usage_and_ttft() {
+        let m = Arc::new(Metrics::default());
+        let mut tee = UsageTeeStream::new(NullStream, test_ctx(m.clone(), Some("trace-2")), true, 200);
+
+        // A data line split across two chunks (no newline in the first chunk).
+        let part1 = br#"data: {"choices":[{"delta":{"content":"hi"}}]}"#;
+        let part2 = b"\n\n";
+        tee.consume(part1, Instant::now());
+        assert_eq!(m.local_observations.load(Ordering::Relaxed), 0);
+        tee.consume(part2, Instant::now());
+
+        // Terminal usage event with empty choices.
+        let usage =
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"prompt_tokens_details\":{\"cached_tokens\":2}}}\n\n";
+        tee.consume(usage, Instant::now());
+        tee.finalize();
+
+        assert_eq!(m.prompt_tokens_stats().total, 3);
+        assert_eq!(m.completion_tokens_stats().total, 4);
+        assert_eq!(m.cached_tokens_stats().total, 2);
+        assert_eq!(m.ttft_stats().valid, 1);
+        assert_eq!(m.generation_stats().valid, 1);
+    }
+
+    // Drives the tee through the real `poll_next` path and asserts bytes are
+    // forwarded to the client unchanged and finalize fires exactly once.
+    struct ChunkStream {
+        chunks: std::collections::VecDeque<bytes::Bytes>,
+    }
+    impl Stream for ChunkStream {
+        type Item = Result<bytes::Bytes, reqwest::Error>;
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let me = self.get_mut();
+            match me.chunks.pop_front() {
+                Some(b) => Poll::Ready(Some(Ok(b))),
+                None => Poll::Ready(None),
+            }
+        }
+    }
+
+    struct NoopWake;
+    impl std::task::Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    #[tokio::test]
+    async fn tee_forwards_bytes_unchanged_and_finalizes_once() {
+        let m = Arc::new(Metrics::default());
+        let body: &[u8] = br#"{"choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":2,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":1}}}"#;
+        let mid = body.len() / 2;
+        let chunks = vec![
+            bytes::Bytes::copy_from_slice(&body[..mid]),
+            bytes::Bytes::copy_from_slice(&body[mid..]),
+        ];
+        let inner = ChunkStream {
+            chunks: chunks.into(),
+        };
+        let tee = UsageTeeStream::new(inner, test_ctx(m.clone(), Some("t")), false, 200);
+        let mut pin = Box::pin(tee);
+
+        let waker = std::task::Waker::from(Arc::new(NoopWake));
+        let mut cx = Context::from_waker(&waker);
+
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            match pin.as_mut().poll_next(&mut cx) {
+                Poll::Ready(Some(Ok(b))) => out.extend_from_slice(&b),
+                Poll::Ready(Some(Err(_))) => panic!("unexpected stream error"),
+                Poll::Ready(None) => break,
+                Poll::Pending => panic!("unexpected pending in finite stream"),
+            }
+        }
+
+        // Byte-for-byte passthrough to the client.
+        assert_eq!(out.as_slice(), body);
+        // Exactly one finalize, with tokens parsed from the reassembled JSON.
+        assert_eq!(m.local_observations.load(Ordering::Relaxed), 1);
+        assert_eq!(m.prompt_tokens_stats().total, 2);
+        assert_eq!(m.completion_tokens_stats().total, 3);
+        assert_eq!(m.cached_tokens_stats().total, 1);
+    }
 }

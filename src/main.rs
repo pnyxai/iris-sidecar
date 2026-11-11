@@ -88,7 +88,7 @@ fn main() -> Result<()> {
             models: models_map.clone(),
             model_health: models_map.keys().map(|k| (k.clone(), false)).collect(),
             last_health_check: None,
-            metrics: Metrics::default(),
+            metrics: Arc::new(Metrics::default()),
             available_models: Vec::new(),
         }));
 
