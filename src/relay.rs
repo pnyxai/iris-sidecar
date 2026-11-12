@@ -566,6 +566,93 @@ async fn try_fallback(
 }
 
 // ──────────────────────────────────────────────────────────────
+// Gateway error enrichment
+// ──────────────────────────────────────────────────────────────
+// The gateway returns informative JSON bodies on error (OpenAI-style
+// `{"error": {"message": ...}}`). We read those bodies so the warning logs
+// and the client-facing error both carry the gateway's own explanation
+// instead of a bare status code.
+
+/// Max bytes buffered when reading a gateway error body for logging and
+/// enrichment. Error bodies are small JSON; the cap only guards against
+/// pathological responses.
+const ERROR_BODY_CAP: usize = 64 * 1024;
+
+/// Read a gateway error body into a JSON value (a string value when the body
+/// isn't valid JSON), capped at `ERROR_BODY_CAP`. Safe to buffer: error
+/// responses are never streaming SSE bodies.
+async fn read_gateway_error_body(
+    mut resp: reqwest::Response,
+) -> Result<serde_json::Value, StatusCode> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut capped = false;
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
+        tracing::error!("Failed to read gateway response body: {}", e);
+        StatusCode::BAD_GATEWAY
+    })? {
+        if buf.len() + chunk.len() > ERROR_BODY_CAP {
+            let take = ERROR_BODY_CAP - buf.len();
+            buf.extend_from_slice(&chunk[..take]);
+            capped = true;
+            break;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    if capped {
+        tracing::warn!(
+            "Gateway error body exceeded {} bytes; truncated before logging/return",
+            ERROR_BODY_CAP
+        );
+    }
+    Ok(serde_json::from_slice::<serde_json::Value>(&buf).unwrap_or_else(|_| {
+        serde_json::Value::String(String::from_utf8_lossy(&buf).to_string())
+    }))
+}
+
+/// Extract the informative message from a gateway error body: `error.message`
+/// (OpenAI-style) first, then bare strings under `error`, `detail`, `message`.
+/// `None` when nothing string-shaped matches.
+fn gateway_error_message(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .or_else(|| {
+            ["error", "detail", "message"]
+                .iter()
+                .find_map(|k| value.get(*k).and_then(|v| v.as_str()))
+        })
+}
+
+/// Compact JSON (or raw string) preview for logs when no structured message
+/// was found, char-safely truncated.
+fn short_body_preview(value: &serde_json::Value, max_chars: usize) -> String {
+    let compact = value.to_string();
+    let mut chars = compact.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{}…[truncated]", head)
+    } else {
+        head
+    }
+}
+
+/// Sidecar-facing advice embedded in the client error response and log.
+fn gateway_error_hint(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "Sidecar misconfigured.",
+        StatusCode::UNAUTHORIZED => "Sidecar token unauthorized.",
+        StatusCode::PAYMENT_REQUIRED => "Insufficient credits / payment required at the gateway.",
+        StatusCode::FORBIDDEN => "Access forbidden by the gateway.",
+        StatusCode::NOT_FOUND => "Endpoint not found on the gateway.",
+        StatusCode::REQUEST_TIMEOUT => "Gateway timed out.",
+        StatusCode::TOO_MANY_REQUESTS => "Rate limited by the gateway.",
+        s if s.is_server_error() => "Gateway unavailable.",
+        _ => "Gateway rejected the request.",
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
 // relay – the main HTTP request handler
 // ──────────────────────────────────────────────────────────────
 // This function is called for every incoming request. It is `async` because
@@ -744,50 +831,29 @@ pub async fn relay(
         }
     };
 
-    // ── Step 4: Inspect the gateway response status and local-request flag ──
+    // ── Step 4: Inspect the gateway response status ──
     let status = upstream_resp.status();
     if !status.is_success() {
-        // Handle 400 BadRequest specially: do not fallback, return JSON error
-        if status == StatusCode::BAD_REQUEST || status == StatusCode::UNAUTHORIZED {
-            let mut err_msg= "";
-            match status {
-                StatusCode::BAD_REQUEST => {
-                    tracing::warn!("Gateway returned 400 BadRequest — sidecar is misconfigured");
-                    err_msg = "Sidecar misconfigured.";
-                },
-                StatusCode::UNAUTHORIZED => {
-                    tracing::warn!("Gateway returned 401 Unauthorized — is the token correct?");
-                    err_msg = "Sidecar token unauthorized.";
-                },
-                _ => {
-                    // Should never happen
-                },
-            }
-            let gateway_body = upstream_resp.bytes().await.map_err(|e| {
-                tracing::error!("Failed to read gateway response body: {}", e);
-                StatusCode::BAD_GATEWAY
-            })?;
-            let gateway_response = serde_json::from_slice::<serde_json::Value>(&gateway_body)
-                .unwrap_or_else(|_| {
-                    serde_json::Value::String(String::from_utf8_lossy(&gateway_body).to_string())
-                });
-            let body = json!({
-                "error": err_msg,
-                "gateway_response": gateway_response
-            });
-            let ms = start.elapsed().as_millis() as u64;
-            metrics.record_pnyx(ms);
-            return Ok((status, Json(body)).into_response());
-        }
+        // Read the gateway's informative error body FIRST so both the warning
+        // log and the client-facing response carry the gateway's own message
+        // instead of a bare status code.
+        let gateway_response = read_gateway_error_body(upstream_resp).await?;
+        let message = gateway_error_message(&gateway_response)
+            .map(str::to_string)
+            .unwrap_or_else(|| short_body_preview(&gateway_response, 512));
 
-        match status {
-            StatusCode::PAYMENT_REQUIRED => tracing::warn!("Gateway returned 402 Payment Required"),
-            StatusCode::FORBIDDEN => tracing::warn!("Gateway returned 403 Forbidden"),
-            _ => tracing::warn!("Gateway returned {} error", status),
-        }
+        tracing::warn!(
+            status = %status,
+            hint = gateway_error_hint(status),
+            trace = %trace_router.as_deref().unwrap_or("-"),
+            gateway_message = %message,
+            "Gateway returned non-success status"
+        );
 
-        // Check if we should use the fallback
-        if should_fallback(&config, &healthy) {
+        // 4xx (bad config/token/credits/…) cannot be fixed by calling a local
+        // model, so only 5xx may fall back. Otherwise return an enriched JSON
+        // error carrying the gateway's own response.
+        if status.is_server_error() && should_fallback(&config, &healthy) {
             let resp = try_fallback(
                 &config,
                 &models,
@@ -806,12 +872,15 @@ pub async fn relay(
                 metrics.record_local(ms);
             }
             return resp;
-        } else {
-            // If not, just relay the gateway error to the user
-            let ms = start.elapsed().as_millis() as u64;
-            metrics.record_pnyx(ms);
-            return Ok(stream_reqwest_response(upstream_resp));
         }
+
+        let body = json!({
+            "error": gateway_error_hint(status),
+            "gateway_response": gateway_response
+        });
+        let ms = start.elapsed().as_millis() as u64;
+        metrics.record_pnyx(ms);
+        return Ok((status, Json(body)).into_response());
     }
 
     let local_request = upstream_resp
@@ -1114,5 +1183,50 @@ mod tests {
         assert_eq!(m.prompt_tokens_stats().total, 2);
         assert_eq!(m.completion_tokens_stats().total, 3);
         assert_eq!(m.cached_tokens_stats().total, 1);
+    }
+
+    #[test]
+    fn gateway_error_message_extracts_openai_and_flat_shapes() {
+        let openai = serde_json::json!({ "error": { "message": "bad model", "type": "invalid_request" } });
+        assert_eq!(gateway_error_message(&openai), Some("bad model"));
+
+        let bare_error = serde_json::json!({ "error": "nope" });
+        assert_eq!(gateway_error_message(&bare_error), Some("nope"));
+
+        let detail = serde_json::json!({ "detail": "quota exhausted" });
+        assert_eq!(gateway_error_message(&detail), Some("quota exhausted"));
+
+        let message = serde_json::json!({ "message": "slow down" });
+        assert_eq!(gateway_error_message(&message), Some("slow down"));
+
+        let opaque = serde_json::json!({ "code": 42 });
+        assert_eq!(gateway_error_message(&opaque), None);
+
+        let raw = serde_json::Value::String("plain text".to_string());
+        assert_eq!(gateway_error_message(&raw), None);
+    }
+
+    #[test]
+    fn gateway_error_hint_maps_statuses() {
+        assert_eq!(gateway_error_hint(StatusCode::BAD_REQUEST), "Sidecar misconfigured.");
+        assert_eq!(gateway_error_hint(StatusCode::UNAUTHORIZED), "Sidecar token unauthorized.");
+        assert_eq!(
+            gateway_error_hint(StatusCode::PAYMENT_REQUIRED),
+            "Insufficient credits / payment required at the gateway."
+        );
+        assert_eq!(gateway_error_hint(StatusCode::TOO_MANY_REQUESTS), "Rate limited by the gateway.");
+        assert_eq!(gateway_error_hint(StatusCode::INTERNAL_SERVER_ERROR), "Gateway unavailable.");
+        assert_eq!(gateway_error_hint(StatusCode::IM_A_TEAPOT), "Gateway rejected the request.");
+    }
+
+    #[test]
+    fn short_body_preview_truncates_on_char_boundary() {
+        let v = serde_json::json!({ "note": "ünïcödé".repeat(100) });
+        let p = short_body_preview(&v, 20);
+        assert!(p.ends_with("…[truncated]"));
+        assert!(p.chars().count() <= 20 + "…[truncated]".chars().count());
+
+        let small = serde_json::json!({ "a": 1 });
+        assert_eq!(short_body_preview(&small, 512), small.to_string());
     }
 }
