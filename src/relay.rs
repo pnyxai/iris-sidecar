@@ -140,6 +140,8 @@ struct LocalGenContext {
     access_token: String,
     model_tag: String,
     local_call_start: Instant,
+    // Gateway routing time for a gateway-directed generation. `None` (recorded
+    // as ignore-me) when the answer didn't come from the gateway (fallbacks).
     routing_ms: Option<u64>,
     trace_router: Option<String>,
 }
@@ -499,6 +501,8 @@ fn should_fallback(config: &Config, healthy: &[String]) -> bool {
 // the gateway fails.  Picks the target model according to the
 // fallback configuration ("random" or a specific tag) and returns
 // the local model's response streamed back to the user.
+// Routing time is recorded as ignore-me: a fallback is never a
+// gateway-directed generation, so there is no completed routing.
 // ──────────────────────────────────────────────────────────────
 #[allow(clippy::too_many_arguments)]
 async fn try_fallback(
@@ -512,7 +516,6 @@ async fn try_fallback(
     gateway_traces_url: &str,
     access_token: &str,
     trace_router: Option<String>,
-    routing_ms: Option<u64>,
 ) -> Result<Response, StatusCode> {
     let fallback_cfg = config.iris.fallback.as_ref().unwrap();
 
@@ -555,7 +558,8 @@ async fn try_fallback(
         access_token: access_token.to_string(),
         model_tag: model.model_tag.clone(),
         local_call_start,
-        routing_ms,
+        // Fallback is never a gateway-directed generation: no routing time.
+        routing_ms: None,
         trace_router,
     };
     Ok(stream_local_response(local_resp, ctx))
@@ -695,21 +699,20 @@ pub async fn relay(
         .headers(upstream_headers)
         .body(body_bytes.clone());
 
-    // Actually send the request to the gateway and wait for the response.
-    // Routing time ends the moment we receive the gateway's trace-id header;
-    // `trace_router` is also the sole correlation key for the usage report.
-    let (upstream_resp, trace_router, routing_ms) = match upstream_req.send().await {
+    // Actually send the request to the gateway and wait for the response
+    // headers. `trace_router` is the correlation key for the usage report;
+    // `gateway_resp_at` marks when the gateway answered. Routing time is
+    // derived from it only when that answer is a local-generation request —
+    // gateway-passthrough and fallbacks have no routing to measure.
+    let (upstream_resp, trace_router, gateway_resp_at) = match upstream_req.send().await {
         Ok(resp) => {
-            let header_at = Instant::now();
+            let gateway_resp_at = Instant::now();
             let trace_router = resp
                 .headers()
                 .get("Pnyx-Trace-Router")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
-            let routing_ms = trace_router
-                .as_ref()
-                .map(|_| header_at.duration_since(start).as_millis() as u64);
-            (resp, trace_router, routing_ms)
+            (resp, trace_router, Some(gateway_resp_at))
         }
         Err(e) => {
             tracing::error!("Gateway request failed: {}", e);
@@ -726,7 +729,6 @@ pub async fn relay(
                     &metrics,
                     &gateway_traces_url,
                     &config.pnyx.access_token,
-                    None,
                     None,
                 )
                 .await;
@@ -797,7 +799,6 @@ pub async fn relay(
                 &gateway_traces_url,
                 &config.pnyx.access_token,
                 trace_router.clone(),
-                routing_ms,
             )
             .await;
             if let Ok(ref _r) = resp {
@@ -887,6 +888,10 @@ pub async fn relay(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     tracing::debug!("🏠 Model: {}", relay_data.model_tag);
+
+    // The gateway answered asking us to run the generation: routing ended
+    // when that answer's headers arrived.
+    let routing_ms = gateway_resp_at.map(|at| at.duration_since(start).as_millis() as u64);
 
     let local_call_start = Instant::now();
     let local_resp = call_local_model(&client, &parts, payload, model).await?;
