@@ -88,7 +88,7 @@ fn main() -> Result<()> {
             models: models_map.clone(),
             model_health: models_map.keys().map(|k| (k.clone(), false)).collect(),
             last_health_check: None,
-            metrics: Metrics::default(),
+            metrics: Arc::new(Metrics::default()),
             available_models: Vec::new(),
         }));
 
@@ -103,12 +103,12 @@ fn main() -> Result<()> {
             async move {
                 match web::fetch_available_models(&client, &pnyx_config).await {
                     Ok(models) => {
-                        tracing::info!("Loaded {} available models from PNYX on startup", models.len());
+                        tracing::info!("Loaded {} available models signatures from PNYX on startup", models.len());
                         let mut locked = state.write().await;
                         locked.available_models = models;
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to fetch available models on startup: {}", e);
+                        tracing::warn!("Failed to fetch available models signatures on startup: {}", e);
                     }
                 }
             }

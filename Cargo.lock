@@ -601,6 +601,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bytes",
+ "futures-core",
  "http-body-util",
  "rand",
  "reqwest",

@@ -17,6 +17,9 @@ iris:
   #   enabled: true
   #   port: 8081
   #   bind_address: "0.0.0.0"
+  # Note: set the IRIS_CONFIG_READONLY=true environment variable (not a YAML key)
+  # to run in read-only mode for stateless deployments: the web UI hides all
+  # config-editing controls and config.yaml is never written.
 
 models:
   gpt-oss-20b:

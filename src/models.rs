@@ -102,8 +102,30 @@ impl RelayData {
 }
 
 // ──────────────────────────────────────────────────────────────
-// Metrics – counters and timing for local vs PNYX relay
+// Metrics – counters and timing for local vs PNYX relay, plus
+// cumulative OpenAI token usage and generation timings for local
+// generations (totals since Iris start).
 // ──────────────────────────────────────────────────────────────
+
+/// Aggregate stats for one tracked quantity: the running `total`
+/// (sum of valid readings since start), the number of `valid`
+/// readings, and the number of `ignored` readings. Absent values
+/// (the canonical "-1" ignore-me sentinel) are counted in `ignored`
+/// and never added to `total`, so a missing field cannot corrupt
+/// the running sum.
+#[derive(Debug, Clone, Copy)]
+pub struct FieldStats {
+    pub total: u64,
+    pub valid: u64,
+    pub ignored: u64,
+}
+
+impl FieldStats {
+    pub fn avg(&self) -> u64 {
+        self.total.checked_div(self.valid).unwrap_or(0)
+    }
+}
+
 #[derive(Debug)]
 pub struct Metrics {
     pub local_requests: AtomicU64,
@@ -112,6 +134,27 @@ pub struct Metrics {
     pub pnyx_total_ms: AtomicU64,
     pub last_pnyx_status: std::sync::Mutex<String>,
     pub last_pnyx_check_time: std::sync::Mutex<Option<std::time::Instant>>,
+
+    // One observation per completed local generation; token and timing
+    // "valid" counts are derived as (observations - ignored).
+    pub local_observations: AtomicU64,
+
+    // Token usage (canonical OpenAI names). No `cache_creation` storage:
+    // it has no source in OpenAI-compatible responses and is always "-1".
+    pub local_prompt_tokens_sum: AtomicU64,
+    pub local_prompt_tokens_ignored: AtomicU64,
+    pub local_completion_tokens_sum: AtomicU64,
+    pub local_completion_tokens_ignored: AtomicU64,
+    pub local_cached_tokens_sum: AtomicU64,
+    pub local_cached_tokens_ignored: AtomicU64,
+
+    // Timings, in milliseconds.
+    pub local_routing_ms_sum: AtomicU64,
+    pub local_routing_ms_ignored: AtomicU64,
+    pub local_ttft_ms_sum: AtomicU64,
+    pub local_ttft_ms_ignored: AtomicU64,
+    pub local_generation_ms_sum: AtomicU64,
+    pub local_generation_ms_ignored: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -123,6 +166,19 @@ impl Default for Metrics {
             pnyx_total_ms: AtomicU64::new(0),
             last_pnyx_status: std::sync::Mutex::new("unknown".to_string()),
             last_pnyx_check_time: std::sync::Mutex::new(None),
+            local_observations: AtomicU64::new(0),
+            local_prompt_tokens_sum: AtomicU64::new(0),
+            local_prompt_tokens_ignored: AtomicU64::new(0),
+            local_completion_tokens_sum: AtomicU64::new(0),
+            local_completion_tokens_ignored: AtomicU64::new(0),
+            local_cached_tokens_sum: AtomicU64::new(0),
+            local_cached_tokens_ignored: AtomicU64::new(0),
+            local_routing_ms_sum: AtomicU64::new(0),
+            local_routing_ms_ignored: AtomicU64::new(0),
+            local_ttft_ms_sum: AtomicU64::new(0),
+            local_ttft_ms_ignored: AtomicU64::new(0),
+            local_generation_ms_sum: AtomicU64::new(0),
+            local_generation_ms_ignored: AtomicU64::new(0),
         }
     }
 }
@@ -148,6 +204,95 @@ impl Metrics {
         let count = self.pnyx_requests.load(Ordering::Relaxed);
         let total = self.pnyx_total_ms.load(Ordering::Relaxed);
         (count, total)
+    }
+
+    /// Record one OpenAI token-usage reading. `None` marks the field as
+    /// absent: it bumps the ignored counter and is NOT added to the sum.
+    pub fn record_local_usage(&self, prompt: Option<u64>, completion: Option<u64>, cached: Option<u64>) {
+        let add = |sum: &AtomicU64, ign: &AtomicU64, v: Option<u64>| match v {
+            Some(x) => {
+                sum.fetch_add(x, Ordering::Relaxed);
+            }
+            None => {
+                ign.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        add(
+            &self.local_prompt_tokens_sum,
+            &self.local_prompt_tokens_ignored,
+            prompt,
+        );
+        add(
+            &self.local_completion_tokens_sum,
+            &self.local_completion_tokens_ignored,
+            completion,
+        );
+        add(
+            &self.local_cached_tokens_sum,
+            &self.local_cached_tokens_ignored,
+            cached,
+        );
+    }
+
+    /// Record one generation's timing set. Increments the shared observation
+    /// count exactly once. `None` = ignore-me (`-1`), counted but not summed.
+    pub fn record_local_times(&self, routing: Option<u64>, ttft: Option<u64>, generation: Option<u64>) {
+        self.local_observations.fetch_add(1, Ordering::Relaxed);
+        let add = |sum: &AtomicU64, ign: &AtomicU64, v: Option<u64>| match v {
+            Some(x) => {
+                sum.fetch_add(x, Ordering::Relaxed);
+            }
+            None => {
+                ign.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        add(&self.local_routing_ms_sum, &self.local_routing_ms_ignored, routing);
+        add(&self.local_ttft_ms_sum, &self.local_ttft_ms_ignored, ttft);
+        add(
+            &self.local_generation_ms_sum,
+            &self.local_generation_ms_ignored,
+            generation,
+        );
+    }
+
+    fn field(&self, sum: &AtomicU64, ignored: &AtomicU64) -> FieldStats {
+        let observations = self.local_observations.load(Ordering::Relaxed);
+        let ign = ignored.load(Ordering::Relaxed);
+        FieldStats {
+            total: sum.load(Ordering::Relaxed),
+            valid: observations.saturating_sub(ign),
+            ignored: ign,
+        }
+    }
+
+    pub fn prompt_tokens_stats(&self) -> FieldStats {
+        self.field(&self.local_prompt_tokens_sum, &self.local_prompt_tokens_ignored)
+    }
+
+    pub fn completion_tokens_stats(&self) -> FieldStats {
+        self.field(
+            &self.local_completion_tokens_sum,
+            &self.local_completion_tokens_ignored,
+        )
+    }
+
+    pub fn cached_tokens_stats(&self) -> FieldStats {
+        self.field(&self.local_cached_tokens_sum, &self.local_cached_tokens_ignored)
+    }
+
+    pub fn routing_stats(&self) -> FieldStats {
+        self.field(&self.local_routing_ms_sum, &self.local_routing_ms_ignored)
+    }
+
+    pub fn ttft_stats(&self) -> FieldStats {
+        self.field(&self.local_ttft_ms_sum, &self.local_ttft_ms_ignored)
+    }
+
+    pub fn generation_stats(&self) -> FieldStats {
+        self.field(
+            &self.local_generation_ms_sum,
+            &self.local_generation_ms_ignored,
+        )
     }
 
     pub fn set_pnyx_status(&self, status: String) {
@@ -201,5 +346,37 @@ mod tests {
             .unwrap();
 
         assert!(request.headers().get("Invalid Header").is_none());
+    }
+
+    #[test]
+    fn usage_and_times_sum_valid_and_count_ignored() {
+        let m = Metrics::default();
+        // obs 1: prompt=100, completion=50, cached absent, routing absent, ttft absent, gen 2000
+        m.record_local_usage(Some(100), Some(50), None);
+        m.record_local_times(None, None, Some(2000));
+        // obs 2: everything ignored except cached=30 and ttft=45
+        m.record_local_usage(None, None, Some(30));
+        m.record_local_times(None, Some(45), Some(1000));
+
+        let p = m.prompt_tokens_stats();
+        assert_eq!((p.total, p.valid, p.ignored), (100, 1, 1));
+        assert_eq!(p.avg(), 100);
+
+        let c = m.completion_tokens_stats();
+        assert_eq!((c.total, c.valid, c.ignored), (50, 1, 1));
+
+        let ca = m.cached_tokens_stats();
+        assert_eq!((ca.total, ca.valid, ca.ignored), (30, 1, 1));
+
+        let r = m.routing_stats();
+        assert_eq!((r.total, r.valid, r.ignored), (0, 0, 2));
+        assert_eq!(r.avg(), 0);
+
+        let t = m.ttft_stats();
+        assert_eq!((t.total, t.valid, t.ignored), (45, 1, 1));
+
+        let g = m.generation_stats();
+        assert_eq!((g.total, g.valid, g.ignored), (3000, 2, 0));
+        assert_eq!(g.avg(), 1500);
     }
 }

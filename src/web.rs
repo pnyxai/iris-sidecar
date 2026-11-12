@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{Html, Json},
     routing::{get, post},
@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::config::{Config, FallbackConfig, PnyxConfig};
-use crate::models::{LocalModel, Metrics};
+use crate::models::{FieldStats, LocalModel, Metrics};
 
 // ──────────────────────────────────────────────────────────────
 // Shared state (mirrors relay.rs, but mutable)
@@ -31,7 +31,7 @@ pub struct SharedState {
     pub models: HashMap<String, LocalModel>,
     pub model_health: HashMap<String, bool>,
     pub last_health_check: Option<Instant>,
-    pub metrics: Metrics,
+    pub metrics: Arc<Metrics>,
     pub available_models: Vec<String>,
 }
 
@@ -47,6 +47,7 @@ pub fn build_router(state: WebState) -> Router {
         .route("/api/stats", get(api_stats))
         .route("/api/available_models", get(api_available_models))
         .route("/api/v1_models", get(api_v1_models))
+        .route("/api/client_config", get(api_client_config))
         .route("/api/refresh_models", post(api_refresh_models))
         .route("/api/config", get(api_config).post(api_config_update))
         .route("/api/models", post(api_models_update))
@@ -109,8 +110,8 @@ pub async fn fetch_available_models(
     pnyx_config: &PnyxConfig,
 ) -> Result<Vec<String>, reqwest::Error> {
     let url = format!(
-        "{}/insights/models?service={}",
-        pnyx_config.base_url.trim_end_matches('/'),
+        "{}/models?service={}",
+        pnyx_config.gateway_insights_url(),
         pnyx_config.service_name
     );
     let resp = client
@@ -123,7 +124,7 @@ pub async fn fetch_available_models(
     let status = resp.status();
     if !status.is_success() {
         tracing::warn!(
-            "Failed to fetch available models: HTTP {} from {}",
+            "Failed to fetch available models signatures: HTTP {} from {}",
             status,
             url
         );
@@ -146,7 +147,7 @@ pub async fn fetch_available_models(
 
     tags.sort();
 
-    tracing::info!("Fetched {} available models from PNYX", tags.len());
+    tracing::info!("Fetched {} available models signatures from PNYX", tags.len());
     Ok(tags)
 }
 
@@ -154,6 +155,13 @@ pub async fn fetch_available_models(
 // Fetch OpenAI-style /v1/models list from PNYX gateway
 // ──────────────────────────────────────────────────────────────
 async fn api_v1_models(State(state): State<WebState>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let body = fetch_v1_models_body(&state).await?;
+    Ok(Json(body))
+}
+
+// Shared helper: fetch the OpenAI-style /v1/models body from the PNYX gateway,
+// advertising healthy local suppliers the same way the relay does.
+async fn fetch_v1_models_body(state: &WebState) -> Result<serde_json::Value, StatusCode> {
     let (client, gateway_url, access_token, local_suppliers) = {
         let guard = state.read().await;
         let healthy: Vec<String> = guard
@@ -164,7 +172,7 @@ async fn api_v1_models(State(state): State<WebState>) -> Result<Json<serde_json:
             .collect();
         (
             guard.client.clone(),
-            guard.config.pnyx.gateway_url(),
+            guard.config.pnyx.gateway_relay_url(),
             guard.config.pnyx.access_token.clone(),
             healthy.join(","),
         )
@@ -187,7 +195,7 @@ async fn api_v1_models(State(state): State<WebState>) -> Result<Json<serde_json:
                 return Err(StatusCode::BAD_GATEWAY);
             }
             match resp.json::<serde_json::Value>().await {
-                Ok(body) => Ok(Json(body)),
+                Ok(body) => Ok(body),
                 Err(e) => {
                     tracing::warn!("Failed to parse /v1/models response: {}", e);
                     Err(StatusCode::BAD_GATEWAY)
@@ -199,6 +207,126 @@ async fn api_v1_models(State(state): State<WebState>) -> Result<Json<serde_json:
             Err(StatusCode::BAD_GATEWAY)
         }
     }
+}
+
+// ──────────────────────────────────────────────────────────────
+// API: /api/client_config?platform=opencode|hermes
+// Renders a ready-to-paste config block for third-party clients.
+// Secrets are never included: when iris.token is set, a placeholder is used.
+// ──────────────────────────────────────────────────────────────
+#[derive(Debug, Deserialize)]
+struct ClientConfigQuery {
+    platform: String,
+}
+
+async fn api_client_config(
+    State(state): State<WebState>,
+    Query(q): Query<ClientConfigQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let bad = |code: StatusCode, msg: String| {
+        tracing::warn!("client_config request failed: {}", msg);
+        (code, Json(json!({ "error": msg })))
+    };
+
+    let (iris_port, token_configured) = {
+        let guard = state.read().await;
+        (guard.config.iris.port, guard.config.iris.token.is_some())
+    };
+
+    let body = fetch_v1_models_body(&state)
+        .await
+        .map_err(|code| bad(code, "Failed to fetch model list from PNYX gateway".to_string()))?;
+
+    // Live gateway list is the single source of truth: healthy local models are
+    // included because the fetch advertises them via Pnyx-Local-Suppliers.
+    let mut seen = std::collections::HashSet::new();
+    let mut models: Vec<String> = Vec::new();
+    if let Some(arr) = body.get("data").and_then(|d| d.as_array()) {
+        for m in arr {
+            if let Some(id) = m.get("id").and_then(|v| v.as_str()) {
+                if seen.insert(id.to_string()) {
+                    models.push(id.to_string());
+                }
+            }
+        }
+    }
+
+    let base_url = format!("http://localhost:{}/v1", iris_port);
+    let default_model = if models.iter().any(|m| m == "PNYX/pocket_network") {
+        "PNYX/pocket_network".to_string()
+    } else if let Some(first) = models.first() {
+        first.clone()
+    } else {
+        "<model-id>".to_string()
+    };
+
+    let content = match q.platform.as_str() {
+        "opencode" => render_opencode_config(&base_url, &models, &default_model, token_configured),
+        "hermes" => render_hermes_config(&base_url, &models, &default_model, token_configured),
+        other => return Err(bad(StatusCode::BAD_REQUEST, format!("Unknown platform '{}'", other))),
+    };
+
+    Ok(Json(json!({
+        "platform": q.platform,
+        "content": content,
+        "model_count": models.len(),
+    })))
+}
+
+fn render_opencode_config(base_url: &str, models: &[String], default_model: &str, token_configured: bool) -> String {
+    let provider_id = "pnyx-iris";
+    let mut models_json = serde_json::Map::new();
+    for id in models {
+        models_json.insert(id.clone(), json!({ "name": id }));
+    }
+
+    let mut options = serde_json::Map::new();
+    options.insert("baseURL".to_string(), json!(base_url));
+    if token_configured {
+        options.insert("apiKey".to_string(), json!("<YOUR-IRIS-TOKEN>"));
+    }
+
+    let mut provider = serde_json::Map::new();
+    provider.insert("npm".to_string(), json!("@ai-sdk/openai-compatible"));
+    provider.insert("name".to_string(), json!("PNYX Iris Sidecar"));
+    provider.insert("options".to_string(), serde_json::Value::Object(options));
+    provider.insert("models".to_string(), serde_json::Value::Object(models_json));
+
+    let value = json!({
+        "$schema": "https://opencode.ai/config.json",
+        "provider": {
+            provider_id: serde_json::Value::Object(provider),
+        },
+        "model": format!("{}/{}", provider_id, default_model),
+    });
+
+    let mut out = String::new();
+    out.push_str(&serde_json::to_string_pretty(&value).unwrap_or_default());
+    out.push('\n');
+    out
+}
+
+fn render_hermes_config(base_url: &str, models: &[String], default_model: &str, token_configured: bool) -> String {
+    let mut out = String::new();
+    out.push_str("# Paste into Hermes config.yaml\n");
+    out.push_str("# Points to the local Iris sidecar (serves gateway + healthy local models)\n");
+    out.push_str("custom_providers:\n");
+    out.push_str("  - name: Iris (PNYX Sidecar)\n");
+    out.push_str(&format!("    base_url: {}\n", base_url));
+    if token_configured {
+        out.push_str("    api_key: \"<YOUR-IRIS-TOKEN>\"  # Replace with iris.token from config.yaml\n");
+    }
+    out.push_str(&format!("    model: {}\n", default_model));
+    out.push_str("    api_mode: chat_completions\n");
+    out.push_str("    models:\n");
+    if models.is_empty() {
+        out.push_str("      {}  # No models returned by the gateway\n");
+    } else {
+        for id in models {
+            out.push_str(&format!("      \"{}\": {{}}\n", id));
+        }
+    }
+    out
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -237,6 +365,8 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   .tooltip:hover::after { content: attr(data-tip); position: absolute; bottom: 120%; left: 50%; transform: translateX(-50%); background: #21262d; color: var(--text); padding: 0.4rem 0.6rem; border-radius: 4px; white-space: nowrap; font-size: 0.8rem; border: 1px solid #30363d; z-index: 100; }
   .badge { display: inline-block; padding: 0.1rem 0.4rem; border-radius: 4px; font-size: 0.75rem; margin-left: 0.5rem; }
   .badge-bad { background: var(--bad); color: #fff; }
+  .badge-readonly { background: var(--warn); color: #000; }
+  .hide-readonly { display: none !important; }
 </style>
 </head>
 <body>
@@ -260,13 +390,13 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 </div>
 
 <div class="card">
-  <h2>Configuration</h2>
-  <div class="row">
+  <h2>Configuration <span id="readonly-badge" class="badge badge-readonly" style="display:none">Read-only</span></h2>
+  <div class="row" id="token-row">
     <label>PNYX Access Token:</label>
     <input type="password" id="token-input" size="40" placeholder="(hidden)" />
     <button onclick="saveToken()">Update Token</button>
   </div>
-  <div class="row" style="margin-top: -0.3rem; font-size: 0.85rem;">
+  <div class="row" id="token-help-row" style="margin-top: -0.3rem; font-size: 0.85rem;">
     <a href="https://app.pnyxai.com" target="_blank" style="color: var(--accent); text-decoration: none;">Don't have a token? Create an account</a>
   </div>
   <div class="row">
@@ -276,7 +406,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     <select id="fallback-model">
       <option value="random">random</option>
     </select>
-    <button onclick="saveFallback()">Save Fallback</button>
+    <button id="save-fallback-btn" onclick="saveFallback()">Save Fallback</button>
   </div>
 </div>
 
@@ -286,6 +416,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     <thead><tr><th>PNYX Reference Tag</th><th>PNYX Remote Configured</th><th>Endpoint</th><th>Model Name</th><th>Custom API Path</th><th>Custom Headers</th><th></th></tr></thead>
     <tbody></tbody>
   </table>
+  <div id="add-model-section">
   <h3>Add Model</h3>
   <div class="row">
     <label>PNYX Tag:</label>
@@ -309,6 +440,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     <input id="new-custom-headers" size="50" placeholder='{"Authorization":"Bearer local-token"} (optional)' />
     <button id="add-btn" onclick="addModel()" disabled>Add</button>
   </div>
+  </div>
 </div>
 
 <div class="card">
@@ -318,6 +450,26 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     <tbody></tbody>
   </table>
 </div>
+
+
+<div class="card">
+  <h2>Client Config</h2>
+  <div class="row">
+    <label for="client-platform">Platform:</label>
+    <select id="client-platform" onchange="resetClientConfig()">
+      <option value="opencode">OpenCode (opencode.json)</option>
+      <option value="hermes">Hermes (config.yaml)</option>
+    </select>
+    <button id="generate-btn" onclick="loadClientConfig()">Generate</button>
+    <button id="copy-btn" onclick="copyClientConfig()" disabled>Copy</button>
+    <span id="copy-feedback" style="color: var(--good); display:none">Copied!</span>
+  </div>
+  <div class="row" style="font-size: 0.85rem; color: #8b949e; margin-top: -0.3rem;">
+    Generated live from the gateway: only models healthy right now (see Local Models Health) are included. Paste into the tool's config file. If it contains <span class="mono">&lt;YOUR-IRIS-TOKEN&gt;</span>, replace it with the iris.token from config.yaml.
+  </div>
+  <pre id="client-config-out" class="mono" style="background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:0.8rem; overflow:auto; max-height:400px; white-space:pre; margin:0;">Check your local models' health above, then click Generate.</pre>
+</div>
+
 
 <script>
   let availableModels = [];
@@ -398,7 +550,10 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       const configuredMark = isLocalBackend ? '<span title="Listed as Local User Backend">✓</span>' : '';
       const valid = availableSet.has(tag);
       const badge = valid ? '' : '<span class="badge badge-bad">Not available in PNYX</span>';
-      tbody.insertAdjacentHTML('beforeend', `<tr><td>${escapeHtml(tag)}${badge}</td><td style="text-align:center">${configuredMark}</td><td>${escapeHtml(m.endpoint)}</td><td>${escapeHtml(m.model_name)}</td><td>${escapeHtml(m.custom_api_path || '')}</td><td>${escapeHtml(Object.keys(m.custom_headers || {}).join(', '))}</td><td><button onclick="removeModel('${escapeHtml(tag)}')">Remove</button></td></tr>`);
+      const removeCell = currentConfig && currentConfig.read_only
+        ? ''
+        : `<td><button onclick="removeModel('${escapeHtml(tag)}')">Remove</button></td>`;
+      tbody.insertAdjacentHTML('beforeend', `<tr><td>${escapeHtml(tag)}${badge}</td><td style="text-align:center">${configuredMark}</td><td>${escapeHtml(m.endpoint)}</td><td>${escapeHtml(m.model_name)}</td><td>${escapeHtml(m.custom_api_path || '')}</td><td>${escapeHtml(Object.keys(m.custom_headers || {}).join(', '))}</td>${removeCell}</tr>`);
     }
 
     const externalTbody = document.querySelector('#external-models-table tbody');
@@ -441,9 +596,20 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     try {
       const r = await fetch('/api/stats');
       const d = await r.json();
+      const ign = (n) => n && n.ignored > 0 ? ' <span style="color:#e3b341">(' + n.ignored + ' ignored)</span>' : '';
+      const u = d.local.usage || {};
+      const t = d.local.timings || {};
+      const tok = 'in ' + (u.prompt_tokens ? u.prompt_tokens.total.toLocaleString() + ign(u.prompt_tokens) : '0')
+        + ' · out ' + (u.completion_tokens ? u.completion_tokens.total.toLocaleString() + ign(u.completion_tokens) : '0')
+        + ' · cached ' + (u.cached_tokens ? u.cached_tokens.total.toLocaleString() + ign(u.cached_tokens) : '0');
+      const tim = 'routing ' + (t.routing_ms ? t.routing_ms.avg + ' ms' + ign(t.routing_ms) : '—')
+        + ' · TTFT ' + (t.ttft_ms ? t.ttft_ms.avg + ' ms' + ign(t.ttft_ms) : '—')
+        + ' · generation ' + (t.generation_ms ? t.generation_ms.avg + ' ms' + ign(t.generation_ms) : '—');
       document.getElementById('stats').innerHTML = `
-        <b>Local:</b> ${d.local.count} reqs, avg ${d.local.avg_ms}ms<br>
-        <b>PNYX:</b> ${d.pnyx.count} reqs, avg ${d.pnyx.avg_ms}ms
+        <b>Local:</b> ${d.local.count} reqs, avg ${d.local.avg_ms} ms<br>
+        <b>PNYX:</b> ${d.pnyx.count} reqs, avg ${d.pnyx.avg_ms} ms<br>
+        <b>Tokens (since start):</b> ${tok}<br>
+        <b>Timings (since start):</b> ${tim}
       `;
     } catch (e) { console.error(e); }
   }
@@ -492,11 +658,30 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     }
   }
 
+  function applyReadOnly(readOnly) {
+    const badge = document.getElementById('readonly-badge');
+    const tokenRow = document.getElementById('token-row');
+    const tokenHelpRow = document.getElementById('token-help-row');
+    const saveFallbackBtn = document.getElementById('save-fallback-btn');
+    const fallbackEnabled = document.getElementById('fallback-enabled');
+    const fallbackModel = document.getElementById('fallback-model');
+    const addSection = document.getElementById('add-model-section');
+
+    badge.style.display = readOnly ? 'inline-block' : 'none';
+    tokenRow.classList.toggle('hide-readonly', readOnly);
+    tokenHelpRow.classList.toggle('hide-readonly', readOnly);
+    saveFallbackBtn.classList.toggle('hide-readonly', readOnly);
+    addSection.classList.toggle('hide-readonly', readOnly);
+    fallbackEnabled.disabled = readOnly;
+    fallbackModel.disabled = readOnly;
+  }
+
   async function loadConfig() {
     try {
       const [cfgR, availR] = await Promise.all([fetch('/api/config'), fetch('/api/available_models')]);
       const d = await cfgR.json();
       currentConfig = d;
+      applyReadOnly(!!d.read_only);
       const availD = await availR.json();
       availableModels = availD.models || [];
       updateTagDropdown();
@@ -568,6 +753,70 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     else showMsg('Failed to remove model', false);
   }
 
+  let clientConfigText = '';
+
+  function resetClientConfig() {
+    clientConfigText = '';
+    document.getElementById('copy-btn').disabled = true;
+    document.getElementById('client-config-out').textContent = 'Check your local models\' health above, then click Generate.';
+  }
+
+  async function loadClientConfig() {
+    const out = document.getElementById('client-config-out');
+    const btn = document.getElementById('generate-btn');
+    const copyBtn = document.getElementById('copy-btn');
+    const platform = document.getElementById('client-platform').value;
+    btn.disabled = true;
+    btn.textContent = 'Generating...';
+    copyBtn.disabled = true;
+    clientConfigText = '';
+    out.textContent = 'Fetching live model list from the gateway...';
+    try {
+      const r = await fetch('/api/client_config?platform=' + encodeURIComponent(platform));
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+      clientConfigText = d.content || '';
+      out.textContent = clientConfigText;
+      copyBtn.disabled = !clientConfigText;
+    } catch (e) {
+      clientConfigText = '';
+      out.textContent = 'Failed to generate config: ' + e.message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Generate';
+    }
+  }
+
+  function copyClientConfig() {
+    if (!clientConfigText) return showMsg('Nothing to copy yet', false);
+    const done = () => {
+      const fb = document.getElementById('copy-feedback');
+      fb.style.display = 'inline';
+      setTimeout(() => fb.style.display = 'none', 2000);
+    };
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(clientConfigText).then(done).catch(() => legacyCopy(clientConfigText, done));
+    } else {
+      legacyCopy(clientConfigText, done);
+    }
+  }
+
+  function legacyCopy(text, done) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand('copy');
+      done();
+    } catch (e) {
+      showMsg('Copy failed', false);
+    }
+    document.body.removeChild(ta);
+  }
+
   loadHealth(); loadStats(); loadConfig();
   setInterval(loadHealth, 10000);
   setInterval(loadStats, 10000);
@@ -617,6 +866,14 @@ fn format_ago(secs: u64) -> String {
 // ──────────────────────────────────────────────────────────────
 // API: /api/stats
 // ──────────────────────────────────────────────────────────────
+fn stat_json(f: FieldStats) -> serde_json::Value {
+    json!({
+        "total": f.total,
+        "avg": f.avg(),
+        "ignored": f.ignored,
+    })
+}
+
 async fn api_stats(State(state): State<WebState>) -> Json<serde_json::Value> {
     let locked = state.read().await;
     let (local_count, local_total) = locked.metrics.local_stats();
@@ -625,8 +882,24 @@ async fn api_stats(State(state): State<WebState>) -> Json<serde_json::Value> {
     let local_avg = if local_count > 0 { local_total / local_count } else { 0 };
     let pnyx_avg = if pnyx_count > 0 { pnyx_total / pnyx_count } else { 0 };
 
+    let usage = json!({
+        "prompt_tokens": stat_json(locked.metrics.prompt_tokens_stats()),
+        "completion_tokens": stat_json(locked.metrics.completion_tokens_stats()),
+        "cached_tokens": stat_json(locked.metrics.cached_tokens_stats()),
+    });
+    let timings = json!({
+        "routing_ms": stat_json(locked.metrics.routing_stats()),
+        "ttft_ms": stat_json(locked.metrics.ttft_stats()),
+        "generation_ms": stat_json(locked.metrics.generation_stats()),
+    });
+
     Json(json!({
-        "local": { "count": local_count, "avg_ms": local_avg },
+        "local": {
+            "count": local_count,
+            "avg_ms": local_avg,
+            "usage": usage,
+            "timings": timings,
+        },
         "pnyx": { "count": pnyx_count, "avg_ms": pnyx_avg },
     }))
 }
@@ -657,7 +930,7 @@ async fn api_refresh_models(State(state): State<WebState>) -> Result<StatusCode,
             Ok(StatusCode::OK)
         }
         Err(e) => {
-            tracing::warn!("Failed to refresh available models: {}", e);
+            tracing::warn!("Failed to refresh available models signatures: {}", e);
             Err(StatusCode::BAD_GATEWAY)
         }
     }
@@ -669,6 +942,11 @@ async fn api_refresh_models(State(state): State<WebState>) -> Result<StatusCode,
 async fn api_config(State(state): State<WebState>) -> Json<serde_json::Value> {
     let locked = state.read().await;
     let mut cfg = serde_json::to_value(&locked.config).unwrap_or_default();
+
+    // Expose read-only mode (field is `serde(skip)`ped, so add it manually)
+    if let Some(obj) = cfg.as_object_mut() {
+        obj.insert("read_only".to_string(), json!(locked.config.read_only));
+    }
 
     // Mask tokens for the UI
     if let Some(pnyx) = cfg.get_mut("pnyx") {
@@ -723,6 +1001,10 @@ async fn api_config_update(
     Json(payload): Json<ConfigUpdate>,
 ) -> Result<StatusCode, StatusCode> {
     let mut locked = state.write().await;
+    if locked.config.read_only {
+        tracing::warn!("Rejected config update: running in read-only mode");
+        return Err(StatusCode::FORBIDDEN);
+    }
     let mut service_changed = false;
 
     if let Some(token) = payload.pnyx_access_token {
@@ -751,7 +1033,7 @@ async fn api_config_update(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // If base_url or service_name changed, re-fetch available models
+    // If base_url or service_name changed, re-fetch available models signatures
     if service_changed {
         let pnyx_config = locked.config.pnyx.clone();
         let client = locked.client.clone();
@@ -763,7 +1045,7 @@ async fn api_config_update(
                 locked.available_models = models;
             }
             Err(e) => {
-                tracing::warn!("Failed to re-fetch available models after config change: {}", e);
+                tracing::warn!("Failed to re-fetch available models signatures after config change: {}", e);
             }
         }
     }
@@ -789,6 +1071,10 @@ async fn api_models_update(
     Json(payload): Json<ModelUpdate>,
 ) -> Result<StatusCode, StatusCode> {
     let mut locked = state.write().await;
+    if locked.config.read_only {
+        tracing::warn!("Rejected models update: running in read-only mode");
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     match payload.action.as_str() {
         "add" => {
