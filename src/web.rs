@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::config::{Config, FallbackConfig, PnyxConfig};
-use crate::models::{FieldStats, LocalModel, Metrics};
+use crate::models::{suppliers_header_value, FieldStats, LocalModel, Metrics};
 
 // ──────────────────────────────────────────────────────────────
 // Shared state (mirrors relay.rs, but mutable)
@@ -174,7 +174,7 @@ async fn fetch_v1_models_body(state: &WebState) -> Result<serde_json::Value, Sta
             guard.client.clone(),
             guard.config.pnyx.gateway_relay_url(),
             guard.config.pnyx.access_token.clone(),
-            healthy.join(","),
+            suppliers_header_value(&guard.models, &healthy),
         )
     };
 
@@ -413,7 +413,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <div class="card">
   <h2>Local Models</h2>
   <table id="models-table">
-    <thead><tr><th>PNYX Reference Tag</th><th>PNYX Remote Configured</th><th>Endpoint</th><th>Model Name</th><th>Custom API Path</th><th>Custom Headers</th><th></th></tr></thead>
+    <thead><tr><th>PNYX Reference Tag</th><th>PNYX Remote Configured</th><th>Endpoint</th><th>Model Name</th><th>Max Model Len</th><th>Custom API Path</th><th>Custom Headers</th><th></th></tr></thead>
     <tbody></tbody>
   </table>
   <div id="add-model-section">
@@ -430,6 +430,10 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   <div class="row">
     <label>Model Name <span class="tooltip" data-tip="The model identifier your local server expects in the JSON payload (e.g., gpt-oss-20b-INT4).">(?)</span></label>
     <input id="new-model-name" placeholder="local-llama" />
+  </div>
+  <div class="row">
+    <label>Max Model Length <span class="tooltip" data-tip="Required: the context window in tokens.">(?)</span></label>
+    <input id="new-max-model-len" type="number" min="1" step="1" placeholder="32768" />
   </div>
   <div class="row">
     <label>Custom API Path <span class="tooltip" data-tip="Only needed if your endpoint does not serve /v1. Provide the actual path it supports for OpenAI-style calls.">(?)</span></label>
@@ -553,7 +557,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       const removeCell = currentConfig && currentConfig.read_only
         ? ''
         : `<td><button onclick="removeModel('${escapeHtml(tag)}')">Remove</button></td>`;
-      tbody.insertAdjacentHTML('beforeend', `<tr><td>${escapeHtml(tag)}${badge}</td><td style="text-align:center">${configuredMark}</td><td>${escapeHtml(m.endpoint)}</td><td>${escapeHtml(m.model_name)}</td><td>${escapeHtml(m.custom_api_path || '')}</td><td>${escapeHtml(Object.keys(m.custom_headers || {}).join(', '))}</td>${removeCell}</tr>`);
+      tbody.insertAdjacentHTML('beforeend', `<tr><td>${escapeHtml(tag)}${badge}</td><td style="text-align:center">${configuredMark}</td><td>${escapeHtml(m.endpoint)}</td><td>${escapeHtml(m.model_name)}</td><td>${escapeHtml(m.max_model_len ?? '')}</td><td>${escapeHtml(m.custom_api_path || '')}</td><td>${escapeHtml(Object.keys(m.custom_headers || {}).join(', '))}</td>${removeCell}</tr>`);
     }
 
     const externalTbody = document.querySelector('#external-models-table tbody');
@@ -727,7 +731,12 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     const tag = document.getElementById('new-tag').value;
     const endpoint = document.getElementById('new-endpoint').value.trim();
     const model_name = document.getElementById('new-model-name').value.trim();
+    const maxModelLenRaw = document.getElementById('new-max-model-len').value.trim();
+    const max_model_len = Number(maxModelLenRaw);
     const custom_api_path = document.getElementById('new-custom-path').value.trim() || null;
+    if (!Number.isInteger(max_model_len) || max_model_len <= 0) {
+      return showMsg('Max Model Length must be a positive whole number of tokens', false);
+    }
     const headersRaw = document.getElementById('new-custom-headers').value.trim();
     let custom_headers = {};
     if (headersRaw) {
@@ -741,7 +750,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       }
     }
     if (!tag || !endpoint || !model_name) return showMsg('Fill all required fields', false);
-    const r = await fetch('/api/models', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({action:'add', tag, endpoint, model_name, custom_api_path, custom_headers}) });
+    const r = await fetch('/api/models', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({action:'add', tag, endpoint, model_name, max_model_len, custom_api_path, custom_headers}) });
     if (r.ok) { showMsg('Model added'); await loadConfig(); }
     else showMsg('Failed to add model', false);
   }
@@ -1062,6 +1071,7 @@ struct ModelUpdate {
     tag: String,
     endpoint: Option<String>,
     model_name: Option<String>,
+    max_model_len: Option<u64>,
     custom_api_path: Option<String>,
     custom_headers: Option<HashMap<String, String>>,
 }
@@ -1080,6 +1090,10 @@ async fn api_models_update(
         "add" => {
             let endpoint = payload.endpoint.ok_or(StatusCode::BAD_REQUEST)?;
             let model_name = payload.model_name.ok_or(StatusCode::BAD_REQUEST)?;
+            let max_model_len = payload.max_model_len.ok_or(StatusCode::BAD_REQUEST)?;
+            if max_model_len == 0 {
+                return Err(StatusCode::BAD_REQUEST);
+            }
             let custom_api_path = payload.custom_api_path;
             let custom_headers = payload.custom_headers.unwrap_or_default();
 
@@ -1089,6 +1103,7 @@ async fn api_models_update(
                 crate::config::ModelConfig {
                     endpoint: endpoint.clone(),
                     model_name: model_name.clone(),
+                    max_model_len,
                     custom_api_path: custom_api_path.clone(),
                     custom_headers: custom_headers.clone(),
                 },
@@ -1099,6 +1114,7 @@ async fn api_models_update(
                     model_tag: tag.clone(),
                     endpoint,
                     model_name,
+                    max_model_len,
                     custom_api_path,
                     custom_headers,
                 },

@@ -129,6 +129,7 @@ pub struct WebUiConfig {
 // Fields:
 //   • endpoint          – Base URL of the local model (e.g. http://localhost:1234)
 //   • model_name        – Model identifier to send in the JSON payload
+//   • max_model_len     – Context length (in tokens) of the model.
 //   • custom_api_path   – Optional: overrides the incoming request path when
 //                         Iris calls this local model.
 //   • custom_headers    – Optional: extra HTTP headers sent to this local model
@@ -138,6 +139,7 @@ pub struct WebUiConfig {
 pub struct ModelConfig {
     pub endpoint: String,                // Base URL of the local model
     pub model_name: String,              // Model identifier to use in the JSON payload
+    pub max_model_len: u64,              // Context length (tokens) of the model
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_api_path: Option<String>, // Optional path override for local model calls
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -307,6 +309,13 @@ impl ModelConfig {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow::anyhow!("Missing required field: model_name"))?;
+        let max_model_len = value
+            .get("max_model_len")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("Missing required field: max_model_len (must be a positive integer of tokens)"))?;
+        if max_model_len == 0 {
+            anyhow::bail!("Invalid field: max_model_len must be greater than 0");
+        }
         let custom_api_path = value
             .get("custom_api_path")
             .and_then(|v| v.as_str())
@@ -319,6 +328,7 @@ impl ModelConfig {
         Ok(ModelConfig {
             endpoint,
             model_name,
+            max_model_len,
             custom_api_path,
             custom_headers,
         })
@@ -438,6 +448,7 @@ mod tests {
             r#"
 endpoint: "http://localhost:1234"
 model_name: "local-llama"
+max_model_len: 32000
 custom_headers:
   Authorization: "Bearer local-token"
   X-Custom: "value"
@@ -446,6 +457,7 @@ custom_headers:
         .unwrap();
 
         let model = ModelConfig::from_value(Some(&value)).unwrap();
+        assert_eq!(model.max_model_len, 32000);
         assert_eq!(
             model.custom_headers.get("Authorization").map(String::as_str),
             Some("Bearer local-token")
@@ -462,12 +474,55 @@ custom_headers:
             r#"
 endpoint: "http://localhost:1234"
 model_name: "local-llama"
+max_model_len: 128000
 "#,
         )
         .unwrap();
 
         let model = ModelConfig::from_value(Some(&value)).unwrap();
         assert!(model.custom_headers.is_empty());
+    }
+
+    #[test]
+    fn missing_max_model_len_is_rejected() {
+        let value: Value = serde_yaml::from_str(
+            r#"
+endpoint: "http://localhost:1234"
+model_name: "local-llama"
+"#,
+        )
+        .unwrap();
+
+        let err = ModelConfig::from_value(Some(&value)).unwrap_err();
+        assert!(err.to_string().contains("max_model_len"));
+    }
+
+    #[test]
+    fn non_numeric_max_model_len_is_rejected() {
+        let value: Value = serde_yaml::from_str(
+            r#"
+endpoint: "http://localhost:1234"
+model_name: "local-llama"
+max_model_len: "32k"
+"#,
+        )
+        .unwrap();
+
+        assert!(ModelConfig::from_value(Some(&value)).is_err());
+    }
+
+    #[test]
+    fn zero_max_model_len_is_rejected() {
+        let value: Value = serde_yaml::from_str(
+            r#"
+endpoint: "http://localhost:1234"
+model_name: "local-llama"
+max_model_len: 0
+"#,
+        )
+        .unwrap();
+
+        assert!(ModelConfig::from_value(Some(&value)).is_err());
     }
 
     #[test]

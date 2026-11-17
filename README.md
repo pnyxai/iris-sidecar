@@ -20,7 +20,7 @@ If your local model is offline or the requests is too complex, the gateway will 
 
 ### Key features
 - **Health monitoring**: Before every request, Iris checks the health of all local models and reports only the healthy ones to the gateway (no downtime due to local hiccups).
-- **Full local model ownership**: Iris controls 100% of the local model configuration (endpoint, model name, etc). The gateway only needs a `model_tag` (i.e. `gpt-oss-20b`) key to understand the capabilities of your model.
+- **Full local model ownership**: Iris controls 100% of the local model configuration (endpoint, model name, context length, etc). The gateway is told which models are healthy via the `Pnyx-Local-Suppliers` header, formatted as `<tag>;<max_model_len>` pairs.
 - **Environment overrides**: Sensitive tokens and the listening port can be set via environment variables.
 - **Streaming support**: Responses from both the gateway and local models are streamed back to the user (SSE/JSON).
 - **Docker ready**: Includes a `Dockerfile` and `docker-compose.yml` for quick deployment without installing Rust.
@@ -70,6 +70,10 @@ models:
     endpoint: "http://localhost:1234"
     # Mandatory: the model name to use in the OpenAI-compatible JSON payload
     model_name: "local-llama"
+    # Mandatory: context window in tokens. Iris advertises each healthy local
+    # model to the gateway via the `Pnyx-Local-Suppliers` header in the format
+    # `<tag>;<max_model_len>` (e.g. "my-local-llm-model;32768").
+    max_model_len: 32768
     # Optional: overrides the incoming request path when calling this local model
     # custom_api_path: "/v1/chat/completions"
     # Optional: extra headers sent to this local model on generation and health checks

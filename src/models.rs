@@ -22,12 +22,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // The `custom_headers` field is optional. Its entries are added to every
 // request Iris makes to this model, including health checks. This is useful
 // for authorization tokens or any other endpoint-specific headers.
+//
+// `max_model_len` is the model's context length in tokens. 
 // ──────────────────────────────────────────────────────────────
 #[derive(Debug, Clone)]
 pub struct LocalModel {
     pub model_tag: String, // Name of the model tag on PNYX (this must match with a tracked model for correct routing)
     pub endpoint: String,  // Base URL, e.g. "http://localhost:1234"
     pub model_name: String, // The model identifier to send in the JSON payload
+    pub max_model_len: u64, // Context length in tokens
     pub custom_api_path: Option<String>, // Optional path override for local model calls
     pub custom_headers: std::collections::HashMap<String, String>, // Optional headers sent to the local model
 }
@@ -68,6 +71,32 @@ impl LocalModel {
         }
         builder.headers(headers)
     }
+
+    /// Format this model for the `Pnyx-Local-Suppliers` header:
+    /// `<tag>;<max_model_len>` (e.g. "gpt-oss-20b;131072").
+    pub fn supplier_entry(&self) -> String {
+        format!("{};{}", self.model_tag, self.max_model_len)
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// suppliers_header_value
+// ──────────────────────────────────────────────────────────────
+// Builds the `Pnyx-Local-Suppliers` header value for the given healthy
+// model tags: `<tag-1>;<context-len-1>,<tag-2>;<context-len-2>`.
+// Tags missing from `models` are skipped (they can only appear if the
+// config changed mid-request).
+// ──────────────────────────────────────────────────────────────
+pub fn suppliers_header_value(
+    models: &std::collections::HashMap<String, LocalModel>,
+    healthy: &[String],
+) -> String {
+    healthy
+        .iter()
+        .filter_map(|tag| models.get(tag))
+        .map(LocalModel::supplier_entry)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -312,9 +341,41 @@ mod tests {
             model_tag: "test-model".to_string(),
             endpoint: "http://localhost:1234".to_string(),
             model_name: "local".to_string(),
+            max_model_len: 32000,
             custom_api_path: None,
             custom_headers,
         }
+    }
+
+    #[test]
+    fn supplier_entry_formats_tag_and_context_length() {
+        let model = test_model(std::collections::HashMap::new());
+        assert_eq!(model.supplier_entry(), "test-model;32000");
+    }
+
+    #[test]
+    fn suppliers_header_value_joins_tag_and_context_length_pairs() {
+        let make = |tag: &str, ctx: u64| LocalModel {
+            model_tag: tag.to_string(),
+            endpoint: "http://localhost:1234".to_string(),
+            model_name: tag.to_string(),
+            max_model_len: ctx,
+            custom_api_path: None,
+            custom_headers: std::collections::HashMap::new(),
+        };
+        let models = std::collections::HashMap::from([
+            ("model-a".to_string(), make("model-a", 131072)),
+            ("model-b".to_string(), make("model-b", 32768)),
+        ]);
+        let healthy = vec!["model-a".to_string(), "model-b".to_string()];
+
+        let value = suppliers_header_value(&models, &healthy);
+        assert_eq!(value, "model-a;131072,model-b;32768");
+
+        // Unknown tags are skipped; empty input yields empty string.
+        let healthy_with_unknown = vec!["model-x".to_string(), "model-b".to_string()];
+        assert_eq!(suppliers_header_value(&models, &healthy_with_unknown), "model-b;32768");
+        assert_eq!(suppliers_header_value(&models, &[]), "");
     }
 
     #[test]

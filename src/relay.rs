@@ -7,8 +7,9 @@
 //   2. Check which local models are currently healthy.
 //   3. Forward the request to the PNYX gateway, adding:
 //      • `Pnyx-Sidecar-Request: true` (tells the gateway this is a side-car)
-//      • `Pnyx-Local-Suppliers: <model1>,<model2>` (tells the gateway which
-//        local models are available and healthy right now)
+//      • `Pnyx-Local-Suppliers: <model1>;<context-len-1>,<model2>;<context-len-2>`
+//        (tells the gateway which local models are available and healthy
+//        right now, along with each model's context length in tokens)
 //   4. Read the gateway response.
 //      a. If the gateway says `Pnyx-Local-Request: false` (or omits the header),
 //         stream the response straight back to the user.
@@ -40,7 +41,7 @@ use serde_json::json; // For picking a random healthy model
 use futures_core::Stream; // For the pass-through usage-tracking body stream
 
 use crate::config::Config;
-use crate::models::{LocalModel, Metrics, RelayData};
+use crate::models::{suppliers_header_value, LocalModel, Metrics, RelayData};
 use crate::web::SharedState;
 
 // ──────────────────────────────────────────────────────────────
@@ -51,8 +52,8 @@ use crate::web::SharedState;
 //
 // This function runs *on-demand* (per request).
 // It returns a list of model names that DID respond with HTTP 200.
-// The caller will attach these names to the `Pnyx-Local-Suppliers` header
-// so the gateway knows which local models are available to route traffic to.
+// The caller attaches these to the `Pnyx-Local-Suppliers` header as
+// `<tag>;<max_model_len>` entries (see `suppliers_header_value`).
 //
 // Arguments:
 //   • `client` – the shared reqwest HTTP client
@@ -766,11 +767,14 @@ pub async fn relay(
     }
 
     if !healthy.is_empty() {
-        let value = healthy.join(","); // e.g. "model-a,model-b"
-        upstream_headers.insert(
-            "Pnyx-Local-Suppliers",
-            HeaderValue::from_str(&value).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-        );
+        // e.g. "model-a;131072,model-b;32768"
+        let value = suppliers_header_value(&models, &healthy);
+        if !value.is_empty() {
+            upstream_headers.insert(
+                "Pnyx-Local-Suppliers",
+                HeaderValue::from_str(&value).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            );
+        }
     }
 
     // Attach the PNYX access token (from YAML or PNYX_TOKEN env var)
