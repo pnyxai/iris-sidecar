@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::config::{Config, FallbackConfig, PnyxConfig};
-use crate::models::{FieldStats, LocalModel, Metrics};
+use crate::models::{suppliers_header_value, FieldStats, LocalModel, Metrics};
 
 // ──────────────────────────────────────────────────────────────
 // Shared state (mirrors relay.rs, but mutable)
@@ -174,7 +174,7 @@ async fn fetch_v1_models_body(state: &WebState) -> Result<serde_json::Value, Sta
             guard.client.clone(),
             guard.config.pnyx.gateway_relay_url(),
             guard.config.pnyx.access_token.clone(),
-            healthy.join(","),
+            suppliers_header_value(&guard.models, &healthy),
         )
     };
 
@@ -239,22 +239,24 @@ async fn api_client_config(
 
     // Live gateway list is the single source of truth: healthy local models are
     // included because the fetch advertises them via Pnyx-Local-Suppliers.
+    // Each entry is (model id, optional max_model_len in tokens).
     let mut seen = std::collections::HashSet::new();
-    let mut models: Vec<String> = Vec::new();
+    let mut models: Vec<(String, Option<u64>)> = Vec::new();
     if let Some(arr) = body.get("data").and_then(|d| d.as_array()) {
         for m in arr {
             if let Some(id) = m.get("id").and_then(|v| v.as_str()) {
                 if seen.insert(id.to_string()) {
-                    models.push(id.to_string());
+                    let max_model_len = m.get("max_model_len").and_then(|v| v.as_u64());
+                    models.push((id.to_string(), max_model_len));
                 }
             }
         }
     }
 
     let base_url = format!("http://localhost:{}/v1", iris_port);
-    let default_model = if models.iter().any(|m| m == "PNYX/pocket_network") {
+    let default_model = if models.iter().any(|(id, _)| id == "PNYX/pocket_network") {
         "PNYX/pocket_network".to_string()
-    } else if let Some(first) = models.first() {
+    } else if let Some((first, _)) = models.first() {
         first.clone()
     } else {
         "<model-id>".to_string()
@@ -273,11 +275,15 @@ async fn api_client_config(
     })))
 }
 
-fn render_opencode_config(base_url: &str, models: &[String], default_model: &str, token_configured: bool) -> String {
+fn render_opencode_config(base_url: &str, models: &[(String, Option<u64>)], default_model: &str, token_configured: bool) -> String {
     let provider_id = "pnyx-iris";
     let mut models_json = serde_json::Map::new();
-    for id in models {
-        models_json.insert(id.clone(), json!({ "name": id }));
+    for (id, max_model_len) in models {
+        let mut entry = json!({ "name": id });
+        if let Some(ctx) = max_model_len {
+            entry["limit"] = json!({ "context": ctx });
+        }
+        models_json.insert(id.clone(), entry);
     }
 
     let mut options = serde_json::Map::new();
@@ -306,7 +312,7 @@ fn render_opencode_config(base_url: &str, models: &[String], default_model: &str
     out
 }
 
-fn render_hermes_config(base_url: &str, models: &[String], default_model: &str, token_configured: bool) -> String {
+fn render_hermes_config(base_url: &str, models: &[(String, Option<u64>)], default_model: &str, token_configured: bool) -> String {
     let mut out = String::new();
     out.push_str("# Paste into Hermes config.yaml\n");
     out.push_str("# Points to the local Iris sidecar (serves gateway + healthy local models)\n");
@@ -322,8 +328,11 @@ fn render_hermes_config(base_url: &str, models: &[String], default_model: &str, 
     if models.is_empty() {
         out.push_str("      {}  # No models returned by the gateway\n");
     } else {
-        for id in models {
-            out.push_str(&format!("      \"{}\": {{}}\n", id));
+        for (id, max_model_len) in models {
+            match max_model_len {
+                Some(ctx) => out.push_str(&format!("      \"{}\": {{max_model_len: {}}}\n", id, ctx)),
+                None => out.push_str(&format!("      \"{}\": {{}}\n", id)),
+            }
         }
     }
     out
@@ -413,7 +422,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <div class="card">
   <h2>Local Models</h2>
   <table id="models-table">
-    <thead><tr><th>PNYX Reference Tag</th><th>PNYX Remote Configured</th><th>Endpoint</th><th>Model Name</th><th>Custom API Path</th><th>Custom Headers</th><th></th></tr></thead>
+    <thead><tr><th>PNYX Reference Tag</th><th>PNYX Remote Configured</th><th>Endpoint</th><th>Model Name</th><th>Max Model Len</th><th>Custom API Path</th><th>Custom Headers</th><th></th></tr></thead>
     <tbody></tbody>
   </table>
   <div id="add-model-section">
@@ -432,6 +441,10 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     <input id="new-model-name" placeholder="local-llama" />
   </div>
   <div class="row">
+    <label>Max Model Length <span class="tooltip" data-tip="Required: the context window in tokens.">(?)</span></label>
+    <input id="new-max-model-len" type="number" min="1" step="1" placeholder="32768" />
+  </div>
+  <div class="row">
     <label>Custom API Path <span class="tooltip" data-tip="Only needed if your endpoint does not serve /v1. Provide the actual path it supports for OpenAI-style calls.">(?)</span></label>
     <input id="new-custom-path" placeholder="/v1/chat/completions (optional)" />
   </div>
@@ -444,9 +457,17 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 </div>
 
 <div class="card">
+  <h2>Router Models</h2>
+  <table id="router-models-table">
+    <thead><tr><th>Model ID</th><th>Provider</th><th>Max Model Len</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<div class="card">
   <h2>External Models <a href="https://app.pnyxai.com/routing/groups" target="_blank" style="font-size:0.85rem; color:var(--accent); text-decoration:none; margin-left:0.5rem;">Configure models in PNYX →</a></h2>
   <table id="external-models-table">
-    <thead><tr><th>PNYX Reference Tag</th><th>Provider</th></tr></thead>
+    <thead><tr><th>PNYX Reference Tag</th><th>Provider</th><th>Max Model Len</th></tr></thead>
     <tbody></tbody>
   </table>
 </div>
@@ -528,6 +549,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       id: m.id,
       normalizedId: normalizeModelId(m.id),
       owned_by: m.owned_by,
+      max_model_len: m.max_model_len,
     }));
 
     const localBackendIds = new Set(
@@ -536,8 +558,13 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         .map(m => m.normalizedId)
     );
 
+    const routerIds = new Set(['PNYX/router', 'PNYX/pocket_network']);
+    const routerModels = [...new Map(
+      normalizedV1.filter(m => routerIds.has(m.id)).map(m => [m.id, m])
+    ).values()];
+
     const externalModels = normalizedV1.filter(m => {
-      if (m.id === 'PNYX/router' || m.id === 'PNYX/pocket_network') return false;
+      if (routerIds.has(m.id)) return false;
       return !configuredIds.has(m.normalizedId);
     });
 
@@ -553,16 +580,26 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       const removeCell = currentConfig && currentConfig.read_only
         ? ''
         : `<td><button onclick="removeModel('${escapeHtml(tag)}')">Remove</button></td>`;
-      tbody.insertAdjacentHTML('beforeend', `<tr><td>${escapeHtml(tag)}${badge}</td><td style="text-align:center">${configuredMark}</td><td>${escapeHtml(m.endpoint)}</td><td>${escapeHtml(m.model_name)}</td><td>${escapeHtml(m.custom_api_path || '')}</td><td>${escapeHtml(Object.keys(m.custom_headers || {}).join(', '))}</td>${removeCell}</tr>`);
+      tbody.insertAdjacentHTML('beforeend', `<tr><td>${escapeHtml(tag)}${badge}</td><td style="text-align:center">${configuredMark}</td><td>${escapeHtml(m.endpoint)}</td><td>${escapeHtml(m.model_name)}</td><td>${escapeHtml(m.max_model_len ?? '')}</td><td>${escapeHtml(m.custom_api_path || '')}</td><td>${escapeHtml(Object.keys(m.custom_headers || {}).join(', '))}</td>${removeCell}</tr>`);
+    }
+
+    const routerTbody = document.querySelector('#router-models-table tbody');
+    routerTbody.innerHTML = '';
+    if (routerModels.length === 0) {
+      routerTbody.insertAdjacentHTML('beforeend', '<tr><td colspan="3">No router models returned by the gateway.</td></tr>');
+    } else {
+      for (const m of routerModels) {
+        routerTbody.insertAdjacentHTML('beforeend', `<tr><td>${escapeHtml(m.id)}</td><td>${escapeHtml(stripProviderPrefix(m.owned_by))}</td><td>${escapeHtml(m.max_model_len ?? '')}</td></tr>`);
+      }
     }
 
     const externalTbody = document.querySelector('#external-models-table tbody');
     externalTbody.innerHTML = '';
     if (externalModels.length === 0) {
-      externalTbody.insertAdjacentHTML('beforeend', '<tr><td colspan="2">No external models available.</td></tr>');
+      externalTbody.insertAdjacentHTML('beforeend', '<tr><td colspan="3">No external models available.</td></tr>');
     } else {
       for (const m of externalModels) {
-        externalTbody.insertAdjacentHTML('beforeend', `<tr><td>${escapeHtml(m.normalizedId)}</td><td>${escapeHtml(stripProviderPrefix(m.owned_by))}</td></tr>`);
+        externalTbody.insertAdjacentHTML('beforeend', `<tr><td>${escapeHtml(m.normalizedId)}</td><td>${escapeHtml(stripProviderPrefix(m.owned_by))}</td><td>${escapeHtml(m.max_model_len ?? '')}</td></tr>`);
       }
     }
   }
@@ -727,7 +764,12 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     const tag = document.getElementById('new-tag').value;
     const endpoint = document.getElementById('new-endpoint').value.trim();
     const model_name = document.getElementById('new-model-name').value.trim();
+    const maxModelLenRaw = document.getElementById('new-max-model-len').value.trim();
+    const max_model_len = Number(maxModelLenRaw);
     const custom_api_path = document.getElementById('new-custom-path').value.trim() || null;
+    if (!Number.isInteger(max_model_len) || max_model_len <= 0) {
+      return showMsg('Max Model Length must be a positive whole number of tokens', false);
+    }
     const headersRaw = document.getElementById('new-custom-headers').value.trim();
     let custom_headers = {};
     if (headersRaw) {
@@ -741,7 +783,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       }
     }
     if (!tag || !endpoint || !model_name) return showMsg('Fill all required fields', false);
-    const r = await fetch('/api/models', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({action:'add', tag, endpoint, model_name, custom_api_path, custom_headers}) });
+    const r = await fetch('/api/models', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({action:'add', tag, endpoint, model_name, max_model_len, custom_api_path, custom_headers}) });
     if (r.ok) { showMsg('Model added'); await loadConfig(); }
     else showMsg('Failed to add model', false);
   }
@@ -1062,6 +1104,7 @@ struct ModelUpdate {
     tag: String,
     endpoint: Option<String>,
     model_name: Option<String>,
+    max_model_len: Option<u64>,
     custom_api_path: Option<String>,
     custom_headers: Option<HashMap<String, String>>,
 }
@@ -1080,6 +1123,10 @@ async fn api_models_update(
         "add" => {
             let endpoint = payload.endpoint.ok_or(StatusCode::BAD_REQUEST)?;
             let model_name = payload.model_name.ok_or(StatusCode::BAD_REQUEST)?;
+            let max_model_len = payload.max_model_len.ok_or(StatusCode::BAD_REQUEST)?;
+            if max_model_len == 0 {
+                return Err(StatusCode::BAD_REQUEST);
+            }
             let custom_api_path = payload.custom_api_path;
             let custom_headers = payload.custom_headers.unwrap_or_default();
 
@@ -1089,6 +1136,7 @@ async fn api_models_update(
                 crate::config::ModelConfig {
                     endpoint: endpoint.clone(),
                     model_name: model_name.clone(),
+                    max_model_len,
                     custom_api_path: custom_api_path.clone(),
                     custom_headers: custom_headers.clone(),
                 },
@@ -1099,6 +1147,7 @@ async fn api_models_update(
                     model_tag: tag.clone(),
                     endpoint,
                     model_name,
+                    max_model_len,
                     custom_api_path,
                     custom_headers,
                 },
@@ -1119,4 +1168,31 @@ async fn api_models_update(
     }
 
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn models() -> Vec<(String, Option<u64>)> {
+        vec![
+            ("PNYX/pocket_network".to_string(), Some(131072)),
+            ("local-llama".to_string(), None),
+        ]
+    }
+
+    #[test]
+    fn opencode_config_includes_limit_context_when_known() {
+        let out = render_opencode_config("http://localhost:8080/v1", &models(), "PNYX/pocket_network", false);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["provider"]["pnyx-iris"]["models"]["PNYX/pocket_network"]["limit"]["context"], 131072);
+        assert!(v["provider"]["pnyx-iris"]["models"]["local-llama"].get("limit").is_none());
+    }
+
+    #[test]
+    fn hermes_config_includes_max_model_len_when_known() {
+        let out = render_hermes_config("http://localhost:8080/v1", &models(), "PNYX/pocket_network", false);
+        assert!(out.contains("\"PNYX/pocket_network\": {max_model_len: 131072}"));
+        assert!(out.contains("\"local-llama\": {}"));
+    }
 }
